@@ -34,6 +34,7 @@ class FakeRobot:
     def __init__(self):
         self.pose = transl(500, 0, 200)
         self.moved_pose = None
+        self.move_test_result = None
 
     def Pose(self):  # noqa: N802
         return self.pose
@@ -42,6 +43,8 @@ class FakeRobot:
         return []
 
     def MoveL_Test(self, _joints, pose):  # noqa: N802
+        if self.move_test_result is not None:
+            return self.move_test_result
         return 0 if pose.Pos()[2] >= 100 else -1
 
     def MoveL(self, pose):  # noqa: N802
@@ -208,19 +211,58 @@ def test_camera_far_length_is_read_from_settings():
     ) == 2005.0
 
 
-def test_unsafe_absolute_motion_is_rejected():
+def test_unsafe_absolute_motion_is_logged_and_returns_current_state(caplog):
+    env = make_environment()
+
+    observations, state = env.step(
+        [
+            SetAgentPose(
+                agent_id="agent_id_0",
+                location=(0.6, 0.0, 0.2),
+                rotation_quat=(1.0, 0.0, 0.0, 0.0),
+            ),
+            MoveForward(agent_id="agent_id_0", distance=0.01),
+        ]
+    )
+
+    assert env.robot.moved_pose is None
+    assert state["agent_id_0"].position == (0.5, 0.0, 0.2)
+    assert observations["agent_id_0"]["patch"]["rgba"].shape == (6, 8, 4)
+    assert "maximum is" in caplog.text
+    assert "robot did not move" in caplog.text
+
+
+def test_ik_rejected_motion_is_logged_and_returns_current_state(caplog):
+    env = make_environment()
+    env.robot.move_test_result = -1
+
+    observations, state = env.step(
+        [MoveForward(agent_id="agent_id_0", distance=0.01)]
+    )
+
+    assert env.robot.moved_pose is None
+    assert state["agent_id_0"].position == (0.5, 0.0, 0.2)
+    assert observations["agent_id_0"]["patch"]["rgba"].shape == (6, 8, 4)
+    assert "RoboDK rejected the motion safety check" in caplog.text
+    assert "robot did not move" in caplog.text
+
+
+def test_direct_unsafe_move_raises_detailed_error():
     env = make_environment()
 
     with pytest.raises(UnsafeMoveError, match="maximum is"):
-        env.step(
-            [
-                SetAgentPose(
-                    agent_id="agent_id_0",
-                    location=(0.6, 0.0, 0.2),
-                    rotation_quat=(1.0, 0.0, 0.0, 0.0),
-                )
-            ]
-        )
+        env._move_to_pose(transl(600, 0, 200))
+
+    assert env.robot.moved_pose is None
+
+
+def test_below_floor_move_is_rejected_with_specific_reason():
+    env = make_environment()
+    env.max_step_mm = 500.0
+    env.robot.pose = transl(500, 0, 200)
+
+    with pytest.raises(UnsafeMoveError, match="minimum safe Z"):
+        env._move_to_pose(transl(500, 0, 50))
 
     assert env.robot.moved_pose is None
 

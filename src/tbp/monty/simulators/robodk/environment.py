@@ -238,7 +238,7 @@ class RoboDKFanucEnvironment:
 
         depth_mm = np.flipud(depth_words[2:].reshape(height, width)).astype(
             np.float32
-        )I
+        )
         return depth_mm * (
             far_length_mm / (np.iinfo(np.uint32).max * 1000.0)
         )
@@ -408,7 +408,13 @@ class RoboDKFanucEnvironment:
                 f"Requested move is {displacement_mm:.1f} mm; "
                 f"maximum is {self.max_step_mm:.1f} mm"
             )
-        if not self.is_move_safe(target_pose):
+        _, _, target_z_mm = target_pose.Pos()
+        if target_z_mm < self.min_safe_z_mm:
+            raise UnsafeMoveError(
+                f"Target Z is {target_z_mm:.1f} mm; "
+                f"minimum safe Z is {self.min_safe_z_mm:.1f} mm"
+            )
+        if self.robot.MoveL_Test(self.robot.Joints(), target_pose) != 0:
             raise UnsafeMoveError("RoboDK rejected the motion safety check")
         self.robot.MoveL(target_pose)
 
@@ -449,6 +455,19 @@ class RoboDKFanucEnvironment:
     def step(
         self, actions: Sequence[Action]
     ) -> tuple[Observations, ProprioceptiveState]:
+        """Apply actions, treating safety-rejected moves as no-ops.
+
+        A rejected action is logged and ends the current action sequence. The
+        environment then returns a fresh observation and the actual robot state so
+        Monty can choose what to do next.
+
+        Returns:
+            The next sensor observations and measured robot state.
+
+        Raises:
+            ValueError: If an action targets a different agent.
+            NotImplementedError: If the action type is unsupported by this adapter.
+        """
         supported_actions = (
             MoveForward,
             MoveTangentially,
@@ -473,7 +492,15 @@ class RoboDKFanucEnvironment:
                     "SetSensorRotation; calibrate a gimbal or remove this action "
                     "from the motor policy"
                 )
-            action.act(self)
+            try:
+                action.act(self)
+            except UnsafeMoveError as error:
+                logger.warning(
+                    "Rejected unsafe %s action; robot did not move: %s",
+                    type(action).__name__,
+                    error,
+                )
+                break
 
         return self.get_observation(), self._state()
 
