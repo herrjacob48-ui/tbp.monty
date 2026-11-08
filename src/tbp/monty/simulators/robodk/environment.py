@@ -25,6 +25,7 @@ from robodk.robolink import (
     RUNMODE_SIMULATE,
     Item,
     Robolink,
+    TargetReachError,
 )
 from robodk.robomath import Mat, rotx, roty, transl
 from scipy.spatial.transform import Rotation, Slerp
@@ -641,6 +642,13 @@ class RoboDKFanucEnvironment:
             except UnsafeMoveError as error:
                 logger.warning(
                     "Rejected unsafe %s action; robot did not move: %s",
+                    type(action).__name__,
+                    error,
+                )
+                break
+            except TargetReachError as error:
+                logger.warning(
+                    "RoboDK could not reach the target for %s; robot did not move: %s",
                     type(action).__name__,
                     error,
                 )

@@ -14,7 +14,8 @@ import numpy as np
 import pytest
 import quaternion as qt
 from PIL import Image
-from robodk.robomath import rotx, transl
+from robodk.robolink import TargetReachError
+from robodk.robomath import rotx, roty, transl
 
 from tbp.monty.frameworks.actions.actions import (
     MoveForward,
@@ -33,21 +34,32 @@ from tbp.monty.simulators.robodk.environment import (
 class FakeRobot:
     def __init__(self):
         self.pose = transl(500, 0, 200)
+        self.base_pose = transl(0, 0, 0)
         self.moved_pose = None
         self.move_test_result = None
+        self.move_test_calls = 0
+        self.move_error = None
+        self.move_calls = 0
 
     def Pose(self):  # noqa: N802
         return self.pose
 
+    def PoseAbs(self):  # noqa: N802
+        return self.base_pose
+
     def Joints(self):  # noqa: N802
         return []
 
-    def MoveL_Test(self, _joints, pose):  # noqa: N802
+    def MoveL_Test(self, _joints, _pose):  # noqa: N802
+        self.move_test_calls += 1
         if self.move_test_result is not None:
             return self.move_test_result
-        return 0 if pose.Pos()[2] >= 100 else -1
+        return 0
 
     def MoveL(self, pose):  # noqa: N802
+        self.move_calls += 1
+        if self.move_error is not None:
+            raise self.move_error
         self.pose = pose
         self.moved_pose = pose
 
@@ -69,13 +81,29 @@ class FakeRoboDK:
         return self.image_bytes
 
 
-def make_environment(depth_provider=None, observation_output_dir=None):
+class FakeTableReference:
+    def __init__(self, height_mm=0.0):
+        self.pose = transl(0.0, 0.0, height_mm)
+
+    def PoseAbs(self):  # noqa: N802
+        return self.pose
+
+
+def make_environment(
+    depth_provider=None,
+    observation_output_dir=None,
+    table_height_mm=0.0,
+    check_motion_safety=True,
+):
     env = RoboDKFanucEnvironment.__new__(RoboDKFanucEnvironment)
     env.resolution = (8, 6)
     env.agent_id = "agent_id_0"
     env.sensor_id = "patch"
     env.sensor_ids = ["patch", "view_finder"]
-    env.min_safe_z_mm = 100.0
+    env.camera_dimensions_mm = np.asarray((100.0, 60.0, 50.0))
+    env.table_clearance_mm = 10.0
+    env.table_height_mm = table_height_mm
+    env.check_motion_safety = check_motion_safety
     env.max_step_mm = 50.0
     env.depth_provider = depth_provider
     env.require_depth = False
@@ -91,6 +119,7 @@ def make_environment(depth_provider=None, observation_output_dir=None):
     env.rdk = FakeRoboDK()
     env.camera = object()
     env.robot = FakeRobot()
+    env.table_reference = FakeTableReference(table_height_mm)
     env.home_joints = []
     return env
 
@@ -247,6 +276,33 @@ def test_ik_rejected_motion_is_logged_and_returns_current_state(caplog):
     assert "robot did not move" in caplog.text
 
 
+def test_unreachable_target_is_logged_and_does_not_abort_step(caplog):
+    env = make_environment(check_motion_safety=False)
+    env.robot.move_error = TargetReachError("Target cannot be reached")
+
+    observations, state = env.step(
+        [
+            MoveForward(agent_id="agent_id_0", distance=0.01),
+            MoveForward(agent_id="agent_id_0", distance=0.01),
+        ]
+    )
+
+    assert env.robot.moved_pose is None
+    assert env.robot.move_calls == 1
+    assert state["agent_id_0"].position == (0.5, 0.0, 0.2)
+    assert observations["agent_id_0"]["patch"]["rgba"].shape == (6, 8, 4)
+    assert "RoboDK could not reach the target" in caplog.text
+    assert "Target cannot be reached" in caplog.text
+
+
+def test_unexpected_move_error_still_propagates():
+    env = make_environment(check_motion_safety=False)
+    env.robot.move_error = RuntimeError("unexpected failure")
+
+    with pytest.raises(RuntimeError, match="unexpected failure"):
+        env.step([MoveForward(agent_id="agent_id_0", distance=0.01)])
+
+
 def test_direct_unsafe_move_raises_detailed_error():
     env = make_environment()
 
@@ -256,13 +312,66 @@ def test_direct_unsafe_move_raises_detailed_error():
     assert env.robot.moved_pose is None
 
 
-def test_below_floor_move_is_rejected_with_specific_reason():
-    env = make_environment()
-    env.max_step_mm = 500.0
-    env.robot.pose = transl(500, 0, 200)
+def test_disabling_motion_safety_bypasses_distance_table_and_ik_checks():
+    env = make_environment(table_height_mm=100.0, check_motion_safety=False)
+    env.robot.move_test_result = -1
 
-    with pytest.raises(UnsafeMoveError, match="minimum safe Z"):
-        env._move_to_pose(transl(500, 0, 50))
+    env._move_to_pose(transl(600.0, 0.0, 50.0))
+
+    assert tuple(env.robot.moved_pose.Pos()) == (600.0, 0.0, 50.0)
+    assert env.robot.move_test_calls == 0
+
+
+def test_physical_robot_mode_cannot_disable_motion_safety():
+    with pytest.raises(
+        ValueError, match="cannot be disabled in physical-robot mode"
+    ):
+        RoboDKFanucEnvironment(use_real_robot=True, check_motion_safety=False)
+
+
+def test_camera_box_allows_tcp_below_legacy_minimum_when_clear_of_table():
+    env = make_environment()
+    env.robot.pose = transl(500, 0, 120)
+
+    env._move_to_pose(transl(500, 0, 80))
+
+    assert tuple(env.robot.moved_pose.Pos()) == (500.0, 0.0, 80.0)
+
+
+def test_table_height_is_converted_from_station_to_robot_base_frame():
+    robot = FakeRobot()
+    robot.base_pose = transl(100.0, 20.0, 30.0) * roty(np.pi / 2)
+    table_reference = FakeTableReference()
+    table_reference.pose = robot.base_pose * transl(25.0, 0.0, 80.0)
+
+    table_height_mm = RoboDKFanucEnvironment._table_height_in_robot_base_mm(
+        robot, table_reference
+    )
+
+    assert table_height_mm == pytest.approx(80.0)
+
+
+def test_camera_box_must_clear_table_by_configured_margin():
+    env = make_environment(table_height_mm=100.0)
+    env.max_step_mm = 100.0
+
+    with pytest.raises(
+        UnsafeMoveError, match=r"table Z 100\.0 mm plus 10\.0 mm"
+    ):
+        env._move_to_pose(transl(500, 0, 130))
+
+    assert env.robot.moved_pose is None
+
+
+def test_camera_rotation_is_checked_along_the_move_not_only_at_endpoints():
+    env = make_environment()
+    env.robot.pose = transl(500, 0, 63)
+    target_pose = transl(500, 0, 63) * roty(np.pi / 2)
+
+    assert env._camera_bottom_z_mm(env.robot.pose) >= 10.0
+    assert env._camera_bottom_z_mm(target_pose) >= 10.0
+    with pytest.raises(UnsafeMoveError, match="minimum Z"):
+        env._move_to_pose(target_pose)
 
     assert env.robot.moved_pose is None
 
