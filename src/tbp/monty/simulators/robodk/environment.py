@@ -27,7 +27,7 @@ from robodk.robolink import (
     Robolink,
 )
 from robodk.robomath import Mat, rotx, roty, transl
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 from tbp.monty.frameworks.actions.actions import (
     Action,
@@ -87,16 +87,32 @@ class RoboDKFanucEnvironment:
         view_finder_sensor_id: str | None = "view_finder",
         object_names: tuple[str, ...] | None = None,
         use_real_robot: bool = False,
-        min_safe_z_mm: float = 100.0,
+        check_motion_safety: bool = True,
+        table_reference_name: str = "Object Inspection",
+        camera_dimensions_mm: tuple[float, float, float] = (100.0, 60.0, 50.0),
+        table_clearance_mm: float = 10.0,
         max_step_mm: float = 50.0,
         depth_provider: DepthProvider | None = None,
         require_depth: bool = False,
         observation_output_dir: str | Path | None = None,
     ):
+        self._validate_motion_safety_mode(use_real_robot, check_motion_safety)
         if len(resolution) != 2 or any(size <= 0 for size in resolution):
             raise ValueError("resolution must be a positive (width, height) pair")
-        if min_safe_z_mm < 0 or max_step_mm <= 0:
-            raise ValueError("safety limits must be positive")
+        camera_dimensions = np.asarray(camera_dimensions_mm, dtype=float)
+        if (
+            camera_dimensions.shape != (3,)
+            or not np.isfinite(camera_dimensions).all()
+            or np.any(camera_dimensions <= 0)
+        ):
+            raise ValueError(
+                "camera_dimensions_mm must contain three positive finite "
+                "dimensions in TCP-local X, Y, Z order"
+            )
+        if not np.isfinite(table_clearance_mm) or table_clearance_mm < 0:
+            raise ValueError("table_clearance_mm must be finite and non-negative")
+        if not np.isfinite(max_step_mm) or max_step_mm <= 0:
+            raise ValueError("max_step_mm must be positive and finite")
 
         self.resolution = tuple(resolution)
         self.agent_id = AgentID(agent_id)
@@ -107,7 +123,10 @@ class RoboDKFanucEnvironment:
             if view_finder_id == self.sensor_id:
                 raise ValueError("patch and view-finder sensor IDs must be different")
             self.sensor_ids.append(view_finder_id)
-        self.min_safe_z_mm = min_safe_z_mm
+        self.table_reference_name = table_reference_name
+        self.camera_dimensions_mm = camera_dimensions
+        self.table_clearance_mm = table_clearance_mm
+        self.check_motion_safety = check_motion_safety
         self.max_step_mm = max_step_mm
         self.depth_provider = depth_provider
         self.require_depth = require_depth
@@ -143,6 +162,13 @@ class RoboDKFanucEnvironment:
         if not self.robot.Valid():
             raise LookupError(f"RoboDK robot {robot_name!r} was not found")
 
+        self._initialize_table_clearance(
+            check_motion_safety,
+            table_reference_name,
+            camera_dimensions,
+            table_clearance_mm,
+        )
+
         self.camera = self.rdk.Item(camera_name, ITEM_TYPE_CAMERA)
         if not self.camera.Valid():
             self.camera = self.rdk.Item("Camera", ITEM_TYPE_CAMERA)
@@ -177,6 +203,49 @@ class RoboDKFanucEnvironment:
             self._depth_far_length_mm = self._camera_far_length_mm(
                 self.camera.setParam("Settings")
             )
+
+    @staticmethod
+    def _validate_motion_safety_mode(
+        use_real_robot: bool, check_motion_safety: bool
+    ) -> None:
+        if use_real_robot and not check_motion_safety:
+            raise ValueError(
+                "check_motion_safety cannot be disabled in physical-robot mode"
+            )
+
+    def _initialize_table_clearance(
+        self,
+        check_motion_safety: bool,
+        table_reference_name: str,
+        camera_dimensions: npt.NDArray[np.float64],
+        table_clearance_mm: float,
+    ) -> None:
+        self.table_reference: Item | None = None
+        self.table_height_mm: float | None = None
+        if not check_motion_safety:
+            logger.warning(
+                "RoboDK motion safety checks are DISABLED for simulation. "
+                "No distance, tabletop-clearance, or IK checks will reject moves."
+            )
+            return
+
+        self.table_reference = self.rdk.Item(table_reference_name)
+        if not self.table_reference.Valid():
+            raise LookupError(
+                f"RoboDK table reference {table_reference_name!r} was not found"
+            )
+        self.table_height_mm = self._table_height_in_robot_base_mm(
+            self.robot, self.table_reference
+        )
+        logger.warning(
+            "Using camera-only tabletop clearance: box %s mm, reference %r at "
+            "Z=%.1f mm, clearance %.1f mm. Camera dimensions are provisional; "
+            "robot arm and mount collisions are not checked.",
+            tuple(float(size) for size in camera_dimensions),
+            table_reference_name,
+            self.table_height_mm,
+            table_clearance_mm,
+        )
 
     def _connect_robodk(self) -> Robolink:
         candidates = ["127.0.0.1"]
@@ -394,28 +463,103 @@ class RoboDKFanucEnvironment:
         )
 
     def is_move_safe(self, target_pose: Mat) -> bool:
-        _, _, z = target_pose.Pos()
-        if z < self.min_safe_z_mm:
+        if not self.check_motion_safety:
+            return True
+        if self.table_height_mm is None:
+            raise RuntimeError(
+                "Table height is unavailable while safety checks are enabled"
+            )
+        if self._minimum_camera_z_along_path(self.robot.Pose(), target_pose) < (
+            self.table_height_mm + self.table_clearance_mm
+        ):
             return False
         return self.robot.MoveL_Test(self.robot.Joints(), target_pose) == 0
 
+    @staticmethod
+    def _table_height_in_robot_base_mm(robot: Item, table_reference: Item) -> float:
+        """Get the table reference origin's Z coordinate in the robot base frame.
+
+        Returns:
+            The reference origin's base-frame Z coordinate in millimeters.
+
+        Raises:
+            ValueError: If the resolved height is not finite.
+        """
+        table_pose_in_base = robot.PoseAbs().inv() * table_reference.PoseAbs()
+        table_height_mm = float(table_pose_in_base.Pos()[2])
+        if not np.isfinite(table_height_mm):
+            raise ValueError("Table reference height must be finite")
+        return table_height_mm
+
+    def _camera_bottom_z_mm(self, pose: Mat) -> float:
+        pose_matrix = np.asarray(pose.rows, dtype=float)
+        vertical_half_extent = np.abs(pose_matrix[2, :3]) @ (
+            self.camera_dimensions_mm / 2.0
+        )
+        return float(pose_matrix[2, 3] - vertical_half_extent)
+
+    def _minimum_camera_z_along_path(self, start_pose: Mat, target_pose: Mat) -> float:
+        """Conservatively estimate the camera box's lowest Z along a linear move.
+
+        Returns:
+            The estimated minimum camera-box Z in the robot base frame.
+        """
+        start = np.asarray(start_pose.rows, dtype=float)
+        target = np.asarray(target_pose.rows, dtype=float)
+        translation_delta = target[:3, 3] - start[:3, 3]
+        rotations = Rotation.from_matrix(
+            np.stack((start[:3, :3], target[:3, :3]))
+        )
+        angular_distance = float((rotations[0].inv() * rotations[1]).magnitude())
+        translation_distance = float(np.linalg.norm(translation_delta))
+        sample_count = max(
+            1,
+            int(np.ceil(translation_distance / 5.0)),
+            int(np.ceil(np.rad2deg(angular_distance) / 2.0)),
+        )
+        slerp = Slerp((0.0, 1.0), rotations)
+        half_extents = self.camera_dimensions_mm / 2.0
+        radius = float(np.linalg.norm(half_extents))
+        sample_bottom_z = []
+        for fraction in np.linspace(0.0, 1.0, sample_count + 1):
+            rotation = slerp([fraction]).as_matrix()[0]
+            position = start[:3, 3] + translation_delta * fraction
+            vertical_half_extent = np.abs(rotation[2, :]) @ half_extents
+            sample_bottom_z.append(position[2] - vertical_half_extent)
+
+        # Bound possible between-sample height change from translation and rotation.
+        interpolation_uncertainty = (
+            abs(translation_delta[2]) + radius * angular_distance
+        ) / (2.0 * sample_count)
+        return float(min(sample_bottom_z) - interpolation_uncertainty)
+
     def _move_to_pose(self, target_pose: Mat) -> None:
-        current_position = np.asarray(self.robot.Pose().Pos(), dtype=float)
-        target_position = np.asarray(target_pose.Pos(), dtype=float)
-        displacement_mm = np.linalg.norm(target_position - current_position)
-        if displacement_mm > self.max_step_mm + 1e-6:
-            raise UnsafeMoveError(
-                f"Requested move is {displacement_mm:.1f} mm; "
-                f"maximum is {self.max_step_mm:.1f} mm"
+        if self.check_motion_safety:
+            current_position = np.asarray(self.robot.Pose().Pos(), dtype=float)
+            target_position = np.asarray(target_pose.Pos(), dtype=float)
+            displacement_mm = np.linalg.norm(target_position - current_position)
+            if displacement_mm > self.max_step_mm + 1e-6:
+                raise UnsafeMoveError(
+                    f"Requested move is {displacement_mm:.1f} mm; "
+                    f"maximum is {self.max_step_mm:.1f} mm"
+                )
+            min_camera_z_mm = self._minimum_camera_z_along_path(
+                self.robot.Pose(), target_pose
             )
-        _, _, target_z_mm = target_pose.Pos()
-        if target_z_mm < self.min_safe_z_mm:
-            raise UnsafeMoveError(
-                f"Target Z is {target_z_mm:.1f} mm; "
-                f"minimum safe Z is {self.min_safe_z_mm:.1f} mm"
-            )
-        if self.robot.MoveL_Test(self.robot.Joints(), target_pose) != 0:
-            raise UnsafeMoveError("RoboDK rejected the motion safety check")
+            if self.table_height_mm is None:
+                raise RuntimeError(
+                    "Table height is unavailable while safety checks enabled"
+                )
+            min_allowed_camera_z_mm = self.table_height_mm + self.table_clearance_mm
+            if min_camera_z_mm < min_allowed_camera_z_mm:
+                raise UnsafeMoveError(
+                    f"Camera clearance check estimated a minimum Z of "
+                    f"{min_camera_z_mm:.1f} mm along the move; it must remain at or "
+                    f"above table Z {self.table_height_mm:.1f} mm plus "
+                    f"{self.table_clearance_mm:.1f} mm clearance"
+                )
+            if self.robot.MoveL_Test(self.robot.Joints(), target_pose) != 0:
+                raise UnsafeMoveError("RoboDK rejected the motion safety check")
         self.robot.MoveL(target_pose)
 
     @staticmethod

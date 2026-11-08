@@ -14,6 +14,13 @@ env_init_args:
   object_names:
   - cube
   use_real_robot: false
-  min_safe_z_mm: 100.0
+  check_motion_safety: true
+  table_reference_name: Object Inspection
+  # Provisional camera enclosure dimensions (TCP-local X, Y, Z); measure before lab use.
+  camera_dimensions_mm:
+  - 100.0
+  - 60.0
+  - 50.0
+  table_clearance_mm: 10.0
   max_step_mm: 50.0
   require_depth: true

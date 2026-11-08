@@ -39,4 +39,6 @@ experiment:
         max_total_steps: 2500
     environment:
       env_init_args:
+        # Simulation-only convenience; the adapter rejects this in physical-robot mode.
+        check_motion_safety: false
         max_step_mm: 10.0
