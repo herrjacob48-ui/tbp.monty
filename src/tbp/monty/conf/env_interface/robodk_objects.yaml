@@ -1,0 +1,30 @@
+# @package experiment.config
+
+do_train: true
+train_env_interface_class: ${monty.class:tbp.monty.experiment.environment.OneObjectPerEpisodeInterface}
+train_env_interface_args:
+  object_names: ${experiment.config.environment.env_init_args.object_names}
+  object_init_sampler:
+    _target_: tbp.monty.frameworks.environments.object_init_samplers.Predefined
+    positions:
+    - - 0.6435903931
+      - -0.0300508194
+      - 0.1317496948
+    rotations:
+    - - 0.0
+      - 0.0
+      - -3.875553657
+do_eval: true
+eval_env_interface_class: ${monty.class:tbp.monty.experiment.environment.OneObjectPerEpisodeInterface}
+eval_env_interface_args:
+  object_names: ${experiment.config.environment.env_init_args.object_names}
+  object_init_sampler:
+    _target_: tbp.monty.frameworks.environments.object_init_samplers.Predefined
+    positions:
+    - - 0.6435903931
+      - -0.0300508194
+      - 0.1317496948
+    rotations:
+    - - 0.0
+      - 0.0
+      - -3.875553657

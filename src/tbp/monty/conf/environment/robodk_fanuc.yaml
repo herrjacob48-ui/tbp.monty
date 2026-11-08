@@ -1,0 +1,19 @@
+# @package experiment.config.environment
+
+env_init_func: ${monty.class:tbp.monty.simulators.robodk.environment.RoboDKFanucEnvironment}
+env_init_args:
+  robot_name: Fanuc CRX-10iA
+  camera_name: Camera 1
+  resolution:
+  - 64
+  - 64
+  agent_id: agent_id_0
+  sensor_id: patch
+  view_finder_sensor_id: view_finder
+  # Import each model into the RoboDK station and use its exact item tree name.
+  object_names:
+  - cube
+  use_real_robot: false
+  min_safe_z_mm: 100.0
+  max_step_mm: 50.0
+  require_depth: true

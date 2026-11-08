@@ -66,3 +66,7 @@ def main(cfg: DictConfig):
         experiment.run()
 
     logger.info(f"Done running {experiment} in {time.time() - start_time} seconds")
+
+
+if __name__ == "__main__":
+    main()
