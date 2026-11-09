@@ -135,6 +135,7 @@ class RoboDKFanucEnvironment:
             Path(observation_output_dir) if observation_output_dir is not None else None
         )
         self._observation_count = 0
+        self._last_action_feedback: dict[str, str] | None = None
         if self.observation_output_dir is not None:
             self.observation_output_dir.mkdir(parents=True, exist_ok=True)
             logger.info(
@@ -365,6 +366,10 @@ class RoboDKFanucEnvironment:
             image.resize(self.resolution, Image.Resampling.BILINEAR), dtype=np.uint8
         )
         sensor_observation: SensorObservation = {"rgba": rgba}
+        if self._last_action_feedback is not None:
+            sensor_observation["robodk_action_feedback"] = (
+                self._last_action_feedback.copy()
+            )
 
         if self.depth_provider is not None:
             image_shape = (rgba.shape[0], rgba.shape[1])
@@ -621,6 +626,8 @@ class RoboDKFanucEnvironment:
             SetAgentPose,
             SetSensorRotation,
         )
+        self._last_action_feedback = None
+        last_action: Action | None = None
         for action in actions:
             if action.agent_id != self.agent_id:
                 raise ValueError(
@@ -631,15 +638,16 @@ class RoboDKFanucEnvironment:
                 raise NotImplementedError(
                     f"RoboDK adapter does not support {type(action).__name__}"
                 )
-            if isinstance(action, SetSensorRotation):
-                raise NotImplementedError(
-                    "A fixed, tool-mounted camera cannot independently execute "
-                    "SetSensorRotation; calibrate a gimbal or remove this action "
-                    "from the motor policy"
-                )
             try:
                 action.act(self)
             except UnsafeMoveError as error:
+                self._last_action_feedback = {
+                    "status": "rejected",
+                    "reason": "unsafe",
+                    "action_type": type(action).__name__,
+                    "action_signature": repr(action),
+                    "message": str(error),
+                }
                 logger.warning(
                     "Rejected unsafe %s action; robot did not move: %s",
                     type(action).__name__,
@@ -647,12 +655,27 @@ class RoboDKFanucEnvironment:
                 )
                 break
             except TargetReachError as error:
+                self._last_action_feedback = {
+                    "status": "rejected",
+                    "reason": "unreachable",
+                    "action_type": type(action).__name__,
+                    "action_signature": repr(action),
+                    "message": str(error),
+                }
                 logger.warning(
                     "RoboDK could not reach the target for %s; robot did not move: %s",
                     type(action).__name__,
                     error,
                 )
                 break
+            last_action = action
+
+        if self._last_action_feedback is None and last_action is not None:
+            self._last_action_feedback = {
+                "status": "accepted",
+                "action_type": type(last_action).__name__,
+                "action_signature": repr(last_action),
+            }
 
         return self.get_observation(), self._state()
 
@@ -718,7 +741,19 @@ class RoboDKFanucEnvironment:
         )
         self._move_to_pose(target_pose)
 
+    def actuate_set_sensor_rotation(self, action: SetSensorRotation) -> None:
+        rotation = np.asarray(
+            self._rotation_matrix(action.rotation_quat).rows, dtype=float
+        )[:3, :3]
+        if not np.allclose(rotation, np.eye(3), atol=1e-8):
+            raise NotImplementedError(
+                "A fixed, tool-mounted camera cannot independently execute "
+                "SetSensorRotation; calibrate a gimbal or remove this action "
+                "from the motor policy"
+            )
+
     def reset(self) -> tuple[Observations, ProprioceptiveState]:
+        self._last_action_feedback = None
         self.robot.MoveJ(self.home_joints)
         return self.get_observation(), self._state()
 

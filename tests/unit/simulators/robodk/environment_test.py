@@ -109,6 +109,7 @@ def make_environment(
     env.require_depth = False
     env.observation_output_dir = observation_output_dir
     env._observation_count = 0
+    env._last_action_feedback = None
     env._depth_far_length_mm = None
     env.use_real_robot = False
     env._agent_frame_flip = rotx(np.pi)
@@ -143,6 +144,10 @@ def test_reset_and_step_return_monty_observations_and_state():
 
     observations, state = env.step([MoveForward(agent_id="agent_id_0", distance=0.01)])
 
+    assert (
+        observations["agent_id_0"]["patch"]["robodk_action_feedback"]["status"]
+        == "accepted"
+    )
     np.testing.assert_allclose(
         env.robot.moved_pose.Pos(), (500.0, 0.0, 210.0), atol=1e-12
     )
@@ -274,6 +279,9 @@ def test_ik_rejected_motion_is_logged_and_returns_current_state(caplog):
     assert observations["agent_id_0"]["patch"]["rgba"].shape == (6, 8, 4)
     assert "RoboDK rejected the motion safety check" in caplog.text
     assert "robot did not move" in caplog.text
+    feedback = observations["agent_id_0"]["patch"]["robodk_action_feedback"]
+    assert feedback["status"] == "rejected"
+    assert feedback["reason"] == "unsafe"
 
 
 def test_unreachable_target_is_logged_and_does_not_abort_step(caplog):
@@ -293,6 +301,9 @@ def test_unreachable_target_is_logged_and_does_not_abort_step(caplog):
     assert observations["agent_id_0"]["patch"]["rgba"].shape == (6, 8, 4)
     assert "RoboDK could not reach the target" in caplog.text
     assert "Target cannot be reached" in caplog.text
+    feedback = observations["agent_id_0"]["patch"]["robodk_action_feedback"]
+    assert feedback["status"] == "rejected"
+    assert feedback["reason"] == "unreachable"
 
 
 def test_unexpected_move_error_still_propagates():
@@ -465,7 +476,26 @@ def test_set_agent_pose_accepts_quaternion_object():
     assert tuple(env.robot.moved_pose.Pos()) == (500.0, 0.0, 200.0)
 
 
-def test_fixed_camera_rejects_independent_sensor_rotation():
+def test_fixed_camera_accepts_identity_sensor_rotation_as_noop():
+    env = make_environment()
+
+    observations, _state = env.step(
+        [
+            SetSensorRotation(
+                agent_id="agent_id_0",
+                rotation_quat=(1.0, 0.0, 0.0, 0.0),
+            )
+        ]
+    )
+
+    assert env.robot.moved_pose is None
+    assert (
+        observations["agent_id_0"]["patch"]["robodk_action_feedback"]["status"]
+        == "accepted"
+    )
+
+
+def test_fixed_camera_rejects_nonidentity_sensor_rotation():
     env = make_environment()
 
     with pytest.raises(NotImplementedError, match="tool-mounted camera"):
@@ -473,7 +503,7 @@ def test_fixed_camera_rejects_independent_sensor_rotation():
             [
                 SetSensorRotation(
                     agent_id="agent_id_0",
-                    rotation_quat=(1.0, 0.0, 0.0, 0.0),
+                    rotation_quat=(0.0, 0.0, 0.0, 1.0),
                 )
             ]
         )
