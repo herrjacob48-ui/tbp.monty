@@ -7,10 +7,9 @@ _target_: tbp.monty.simulators.robodk.motor_policy.RoboDKSurfacePolicyCurvatureI
 use_goal_driven_actions: true
 agent_id: agent_id_0
 sensor_id: patch
-desired_object_distance: 0.025
+desired_object_distance: 0.04
 alpha: 0.1
 pc_alpha: 0.5
 max_pc_bias_steps: 32
 min_general_steps: 8
 min_heading_steps: 12
-max_consecutive_rejections: 3

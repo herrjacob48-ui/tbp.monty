@@ -9,12 +9,20 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Protocol, cast
+
+from numpy.random import RandomState
 
 from tbp.monty.cmp import Goal, Message
 from tbp.monty.context import RuntimeContext
 from tbp.monty.experiment.motor_system import ExperimentMotorSystem
-from tbp.monty.frameworks.actions.actions import Action, OrientVertical
+from tbp.monty.frameworks.actions.actions import (
+    Action,
+    MoveForward,
+    OrientHorizontal,
+    OrientVertical,
+)
+from tbp.monty.frameworks.agents import AgentID
 from tbp.monty.frameworks.models.abstract_monty_classes import Observations
 from tbp.monty.frameworks.models.motor_policies import (
     MotorPolicyResult,
@@ -28,22 +36,32 @@ from tbp.monty.memento import Memento
 logger = logging.getLogger(__name__)
 
 
+class RoboDKActionSampler(Protocol):
+    def sample_move_forward(
+        self, agent_id: AgentID, rng: RandomState
+    ) -> MoveForward: ...
+
+    def sample_orient_horizontal(
+        self, agent_id: AgentID, rng: RandomState
+    ) -> OrientHorizontal: ...
+
+    def sample_orient_vertical(
+        self, agent_id: AgentID, rng: RandomState
+    ) -> OrientVertical: ...
+
+
 class RoboDKSurfacePolicyCurvatureInformed(SurfacePolicyCurvatureInformed):
-    """Surface policy that reacts to RoboDK-rejected actions and bounds retries."""
+    """Surface policy that keeps proposing alternatives after RoboDK rejections."""
 
     def __init__(
         self,
-        max_consecutive_rejections: int = 3,
         sensor_id: SensorID | str = "patch",
         **kwargs: Any,
     ) -> None:
-        if max_consecutive_rejections <= 0:
-            raise ValueError("max_consecutive_rejections must be positive")
         super().__init__(**kwargs)
         self.use_goal_driven_actions: bool = bool(
             kwargs.get("use_goal_driven_actions", False)
         )
-        self.max_consecutive_rejections = max_consecutive_rejections
         self.sensor_id = SensorID(sensor_id)
         self._consecutive_rejections = 0
         self._rejected_action_signatures: set[str] = set()
@@ -73,9 +91,7 @@ class RoboDKSurfacePolicyCurvatureInformed(SurfacePolicyCurvatureInformed):
             memento.get("rejected_action_signatures", [])
         )
         self._recovery_mode = memento.get("recovery_mode", False)
-        self._last_rejected_action_type = memento.get(
-            "last_rejected_action_type", ""
-        )
+        self._last_rejected_action_type = memento.get("last_rejected_action_type", "")
 
     def __call__(
         self,
@@ -92,6 +108,9 @@ class RoboDKSurfacePolicyCurvatureInformed(SurfacePolicyCurvatureInformed):
             return self._recover_from_rejection(ctx, feedback)
         if feedback is not None and feedback.get("status") == "accepted":
             self._consecutive_rejections = 0
+            self._rejected_action_signatures.clear()
+            self._recovery_mode = False
+            self._last_rejected_action_type = ""
         elif feedback is not None:
             raise ValueError(
                 f"Unknown RoboDK action feedback status: {feedback.get('status')!r}"
@@ -107,16 +126,32 @@ class RoboDKSurfacePolicyCurvatureInformed(SurfacePolicyCurvatureInformed):
         finally:
             self.use_goal_driven_actions = goal_driven_actions
 
-        if any(
-            repr(action) in self._rejected_action_signatures
+        repeated_actions = [
+            action
             for action in result.actions
-        ):
+            if repr(action) in self._rejected_action_signatures
+        ]
+        if repeated_actions:
+            repeated_signature = repr(repeated_actions[0])
             action = self._sample_untried_alternative(
-                ctx, self._last_rejected_action_type
+                ctx,
+                self._last_rejected_action_type,
+                exclude_signature=repeated_signature,
             )
             if action is None:
-                logger.error("No untried RoboDK recovery action remains")
-                raise StopIteration
+                self._rejected_action_signatures.clear()
+                action = self._sample_untried_alternative(
+                    ctx,
+                    self._last_rejected_action_type,
+                    exclude_signature=repeated_signature,
+                )
+            if action is None:
+                logger.warning(
+                    "No new RoboDK recovery action is available; returning a "
+                    "no-motion step and continuing recovery"
+                )
+                result.actions = []
+                return result
             result.actions = [action]
             result.motor_only_step = action.name != OrientVertical.action_name()
             self.last_surface_policy_action = action
@@ -139,23 +174,21 @@ class RoboDKSurfacePolicyCurvatureInformed(SurfacePolicyCurvatureInformed):
         self._reset_jump_state()
         self._undo_action = None
 
-        if self._consecutive_rejections >= self.max_consecutive_rejections:
-            logger.error(
-                "Ending episode after %d consecutive RoboDK action rejections; "
-                "last action was %s (%s): %s",
-                self._consecutive_rejections,
-                action_type,
-                feedback.get("reason", "unknown"),
-                feedback.get("message", ""),
-            )
-            raise StopIteration
-
-        action = self._sample_untried_alternative(ctx, action_type)
+        action = self._sample_untried_alternative(
+            ctx, action_type, exclude_signature=action_signature
+        )
         if action is None:
-            logger.error(
-                "Ending episode because no untried RoboDK recovery action remains"
+            self._rejected_action_signatures.clear()
+            action = self._sample_untried_alternative(
+                ctx, action_type, exclude_signature=action_signature
             )
-            raise StopIteration
+        if action is None:
+            logger.warning(
+                "No new RoboDK recovery action is available; returning a "
+                "no-motion step and continuing recovery"
+            )
+            self._telemetry = SurfacePolicyTelemetry()
+            return MotorPolicyResult(actions=[], telemetry=self._telemetry)
 
         logger.warning(
             "RoboDK rejected %s (%s); trying a different surface action: %s",
@@ -176,15 +209,17 @@ class RoboDKSurfacePolicyCurvatureInformed(SurfacePolicyCurvatureInformed):
         self,
         ctx: RuntimeContext,
         rejected_action_type: str,
+        exclude_signature: str | None = None,
     ) -> Action | None:
+        action_sampler = cast("RoboDKActionSampler", self.action_sampler)
         action_factories = {
-            "MoveForward": lambda: self.action_sampler.sample_move_forward(
+            "MoveForward": lambda: action_sampler.sample_move_forward(
                 self.agent_id, ctx.rng
             ),
-            "OrientHorizontal": lambda: self.action_sampler.sample_orient_horizontal(
+            "OrientHorizontal": lambda: action_sampler.sample_orient_horizontal(
                 self.agent_id, ctx.rng
             ),
-            "OrientVertical": lambda: self.action_sampler.sample_orient_vertical(
+            "OrientVertical": lambda: action_sampler.sample_orient_vertical(
                 self.agent_id, ctx.rng
             ),
         }
@@ -198,6 +233,49 @@ class RoboDKSurfacePolicyCurvatureInformed(SurfacePolicyCurvatureInformed):
         )
         for action_type in order:
             action = action_factories[action_type]()
-            if repr(action) not in self._rejected_action_signatures:
+            if (
+                repr(action) not in self._rejected_action_signatures
+                and repr(action) != exclude_signature
+            ):
+                return action
+
+        scale = 0.5 ** ((self._consecutive_rejections + 2) // 3)
+        reverse = -1.0 if (self._consecutive_rejections // 6) % 2 else 1.0
+        for action_type in order:
+            action = self._scaled_action(
+                action_factories[action_type](), scale, reverse
+            )
+            if (
+                repr(action) not in self._rejected_action_signatures
+                and repr(action) != exclude_signature
+            ):
+                logger.info(
+                    "All standard RoboDK recovery actions have been rejected; "
+                    "trying a scaled %s action (scale %.6g)",
+                    action_type,
+                    scale,
+                )
                 return action
         return None
+
+    @staticmethod
+    def _scaled_action(action: Action, scale: float, sign: float) -> Action:
+        if isinstance(action, MoveForward):
+            return MoveForward(action.agent_id, action.distance * scale * sign)
+        if isinstance(action, OrientHorizontal):
+            return OrientHorizontal(
+                action.agent_id,
+                action.rotation_degrees * scale * sign,
+                action.left_distance * scale * sign,
+                action.forward_distance * scale * sign,
+            )
+        if isinstance(action, OrientVertical):
+            return OrientVertical(
+                action.agent_id,
+                action.rotation_degrees * scale * sign,
+                action.down_distance * scale * sign,
+                action.forward_distance * scale * sign,
+            )
+        raise TypeError(
+            f"Cannot scale unsupported RoboDK recovery action {type(action).__name__}"
+        )
