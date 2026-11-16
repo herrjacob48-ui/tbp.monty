@@ -289,6 +289,12 @@ class RoboDKFanucEnvironment:
             self._object_items[object_name] = item
             self._initial_object_visibility[object_name] = item.Visible()
 
+        self._prescanned_objects: dict[
+            tuple[str, tuple[float, ...]], dict[str, Any]
+        ] = {}
+        self._object_prescan_view_indices: dict[str, int] = {}
+        self._ensure_single_object_visibility_in_simulation()
+
         self._depth_camera: Item | None = None
         self._depth_far_length_mm: float | None = None
         if require_depth and depth_provider is None:
@@ -305,6 +311,36 @@ class RoboDKFanucEnvironment:
             self._camera_hfov_degrees = self._camera_hfov_degrees_from_settings(
                 self.camera.setParam("Settings")
             )
+
+    def _ensure_single_object_visibility_in_simulation(self) -> None:
+        if self.use_real_robot or len(self._object_items) <= 1:
+            return
+        visible_names = [
+            name for name, item in self._object_items.items() if item.Visible()
+        ]
+        if len(visible_names) > 1:
+            chosen = (
+                self.object_names[0]
+                if self.object_names[0] in visible_names
+                else visible_names[0]
+            )
+            logger.info(
+                "RoboDK simulation: detected %d visible objects (%s) at start. "
+                "Selecting %r to be visible and hiding the rest.",
+                len(visible_names),
+                visible_names,
+                chosen,
+            )
+            for name, item in self._object_items.items():
+                item.setVisible(name == chosen)
+        elif len(visible_names) == 0 and self.object_names:
+            chosen = self.object_names[0]
+            logger.info(
+                "RoboDK simulation: no objects were visible at start. "
+                "Setting %r to be visible.",
+                chosen,
+            )
+            self._object_items[chosen].setVisible(True)
 
     @staticmethod
     def _validate_motion_safety_mode(
@@ -563,9 +599,21 @@ class RoboDKFanucEnvironment:
         if not visible_items:
             return None
         if len(visible_items) != 1:
-            raise RuntimeError(
-                "RoboDK prescan requires exactly one visible target object"
-            )
+            if not self.use_real_robot and len(visible_items) > 1:
+                name, item = visible_items[0]
+                logger.warning(
+                    "RoboDK simulation: multiple objects visible during prescan (%s). "
+                    "Selecting %r to be visible and hiding the rest.",
+                    [n for n, _ in visible_items],
+                    name,
+                )
+                for _other_name, other_item in visible_items[1:]:
+                    other_item.setVisible(False)
+                visible_items = [(name, item)]
+            else:
+                raise RuntimeError(
+                    "RoboDK prescan requires exactly one visible target object"
+                )
         name, item = visible_items[0]
         pose_rows = np.asarray(item.PoseAbs().rows, dtype=float)
         return name, tuple(float(value) for value in pose_rows.ravel())
@@ -709,6 +757,11 @@ class RoboDKFanucEnvironment:
                 points_mm=object_points,
                 metadata_json=np.asarray(json.dumps(self.prescan_geometry)),
             )
+        self._prescanned_objects[object_key] = {
+            "geometry": copy.deepcopy(self.prescan_geometry),
+            "bounds_min_mm": np.copy(estimate_min),
+            "bounds_max_mm": np.copy(estimate_max),
+        }
         self._prescanned_object_key = object_key
         logger.info(
             "RoboDK prescan captured %d object points from %d configured "
@@ -1566,32 +1619,49 @@ class RoboDKFanucEnvironment:
                 if self._prescanned_object_key is None:
                     self.robot.MoveJ(self.home_joints)
             else:
+                object_name = object_key[0]
                 if object_key != self._prescanned_object_key:
-                    self._run_prescan(object_key)
-                    self._current_prescan_view_index = -1
+                    if object_key not in self._prescanned_objects:
+                        self._run_prescan(object_key)
+                    else:
+                        cached = self._prescanned_objects[object_key]
+                        self.prescan_geometry = cached["geometry"]
+                        self._prescanned_object_key = object_key
+                        if self.prescan_enabled:
+                            self._set_prescan_collision_aabb(
+                                cached["bounds_min_mm"], cached["bounds_max_mm"]
+                            )
+                        logger.debug(
+                            "RoboDK prescan cache hit for %r; activated cached AABB.",
+                            object_name,
+                        )
+
                 if self.cycle_prescan_views_on_reset and self.prescan_targets:
-                    self._current_prescan_view_index = (
-                        self._current_prescan_view_index + 1
-                    ) % len(self.prescan_targets)
-                    target = self.prescan_targets[self._current_prescan_view_index]
+                    current_idx = self._object_prescan_view_indices.get(
+                        object_name, -1
+                    )
+                    next_idx = (current_idx + 1) % len(self.prescan_targets)
+                    self._object_prescan_view_indices[object_name] = next_idx
+                    self._current_prescan_view_index = next_idx
+                    target = self.prescan_targets[next_idx]
                     target_name = (
-                        self.prescan_target_names[self._current_prescan_view_index]
-                        if self._current_prescan_view_index
-                        < len(self.prescan_target_names)
-                        else f"Target {self._current_prescan_view_index}"
+                        self.prescan_target_names[next_idx]
+                        if next_idx < len(self.prescan_target_names)
+                        else f"Target {next_idx}"
                     )
                     try:
                         self.robot.MoveJ(target)
                         logger.info(
-                            "RoboDK reset: moved to prescan view %d/%d (%s).",
-                            self._current_prescan_view_index + 1,
+                            "RoboDK reset: moved to prescan view %d/%d (%s) for %r.",
+                            next_idx + 1,
                             len(self.prescan_targets),
                             target_name,
+                            object_name,
                         )
                     except TargetReachError as error:
                         raise RuntimeError(
                             f"RoboDK could not reach prescan target {target_name!r} "
-                            f"on episode reset: {error}"
+                            f"on episode reset for {object_name!r}: {error}"
                         ) from error
         return self.get_observation(), self._state()
 

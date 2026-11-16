@@ -271,6 +271,8 @@ def make_environment(
     env._prescan_aabb_tool = None
     env._prescan_aabb_camera = None
     env._prescanned_object_key = None
+    env._prescanned_objects = {}
+    env._object_prescan_view_indices = {}
     env._camera_hfov_degrees = None
     env.depth_provider = depth_provider
     env.require_depth = False
@@ -1108,7 +1110,13 @@ def test_reset_cycles_prescan_views_when_enabled():
     ]
     env.prescan_targets = targets
     env.prescan_target_names = ("Target 1", "Target 2", "Target 3")
-    env._prescanned_object_key = env._visible_prescan_object_key()
+    key = env._visible_prescan_object_key()
+    env._prescanned_objects[key] = {
+        "geometry": {},
+        "bounds_min_mm": np.zeros(3),
+        "bounds_max_mm": np.ones(3),
+    }
+    env._prescanned_object_key = key
 
     # Episode 0: moves to target 0
     env.reset()
@@ -1155,6 +1163,11 @@ def test_reset_cycles_after_initial_prescan_run():
     env.prescan_target_names = ("Target 1", "Target 2")
 
     def run_prescan(object_key):
+        env._prescanned_objects[object_key] = {
+            "geometry": {},
+            "bounds_min_mm": np.zeros(3),
+            "bounds_max_mm": np.ones(3),
+        }
         env._prescanned_object_key = object_key
 
     env._run_prescan = run_prescan
@@ -1170,3 +1183,104 @@ def test_reset_cycles_after_initial_prescan_run():
     assert env.robot.move_j_calls == 2
     assert env.robot.move_j_targets[-1] == targets[1]
     assert env._current_prescan_view_index == 1
+
+
+def test_visible_prescan_object_key_heals_multiple_visible_in_simulation():
+    class FakeItem:
+        def __init__(self, visible=True, x=650.0):
+            self.visible = visible
+            self.x = x
+
+        def Visible(self):  # noqa: N802
+            return self.visible
+
+        def setVisible(self, val):  # noqa: N802
+            self.visible = val
+
+        def PoseAbs(self):  # noqa: N802
+            return transl(self.x, -30.0, 0.0)
+
+    env = make_environment()
+    env.use_real_robot = False
+    env.object_names = ("cube", "cylinder")
+    cube = FakeItem(visible=True, x=650.0)
+    cylinder = FakeItem(visible=True, x=750.0)
+    env._object_items = {"cube": cube, "cylinder": cylinder}
+
+    key = env._visible_prescan_object_key()
+    assert key is not None
+    assert key[0] == "cube"
+    assert cube.Visible() is True
+    assert cylinder.Visible() is False
+
+
+def test_reset_caches_prescan_and_cycles_per_object():
+    class FakeItem:
+        def __init__(self, visible=False, x=650.0):
+            self.visible = visible
+            self.x = x
+
+        def Visible(self):  # noqa: N802
+            return self.visible
+
+        def setVisible(self, val):  # noqa: N802
+            self.visible = val
+
+        def PoseAbs(self):  # noqa: N802
+            return transl(self.x, -30.0, 0.0)
+
+    env = make_environment(cycle_prescan_views_on_reset=True)
+    env.prescan_enabled = True
+    env.object_names = ("cube", "cylinder")
+    cube = FakeItem(visible=True, x=650.0)
+    cylinder = FakeItem(visible=False, x=750.0)
+    env._object_items = {"cube": cube, "cylinder": cylinder}
+    targets = [
+        FakeTarget(transl(650.0, -30.0, 200.0)),
+        FakeTarget(transl(750.0, -30.0, 150.0)),
+    ]
+    env.prescan_targets = targets
+    env.prescan_target_names = ("Target 1", "Target 2")
+
+    prescan_calls = []
+
+    def mock_run_prescan(object_key):
+        prescan_calls.append(object_key[0])
+        env._prescanned_objects[object_key] = {
+            "geometry": {"object_name": object_key[0]},
+            "bounds_min_mm": np.zeros(3),
+            "bounds_max_mm": np.ones(3),
+        }
+        env._prescanned_object_key = object_key
+
+    env._run_prescan = mock_run_prescan
+
+    # Epoch 1, Episode 1: cube
+    env.reset()
+    assert prescan_calls == ["cube"]
+    assert env._current_prescan_view_index == 0
+    assert env.robot.move_j_targets[-1] == targets[0]
+
+    # Epoch 1, Episode 2: switch to cylinder
+    cube.setVisible(False)
+    cylinder.setVisible(True)
+    env.reset()
+    assert prescan_calls == ["cube", "cylinder"]
+    assert env._current_prescan_view_index == 0
+    assert env.robot.move_j_targets[-1] == targets[0]
+
+    # Epoch 2, Episode 3: switch back to cube (cache hit, advances to view 1)
+    cylinder.setVisible(False)
+    cube.setVisible(True)
+    env.reset()
+    assert prescan_calls == ["cube", "cylinder"]  # no new prescan call!
+    assert env._current_prescan_view_index == 1
+    assert env.robot.move_j_targets[-1] == targets[1]
+
+    # Epoch 2, Episode 4: switch back to cylinder (cache hit, advances to view 1)
+    cube.setVisible(False)
+    cylinder.setVisible(True)
+    env.reset()
+    assert prescan_calls == ["cube", "cylinder"]  # no new prescan call!
+    assert env._current_prescan_view_index == 1
+    assert env.robot.move_j_targets[-1] == targets[1]

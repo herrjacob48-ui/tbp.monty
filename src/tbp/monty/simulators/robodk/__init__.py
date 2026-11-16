@@ -11,5 +11,12 @@ from tbp.monty.simulators.robodk.environment import (
     RoboDKFanucEnvironment,
     UnsafeMoveError,
 )
+from tbp.monty.simulators.robodk.experiments import (
+    RoboDKObjectRecognitionExperiment,
+)
 
-__all__ = ["RoboDKFanucEnvironment", "UnsafeMoveError"]
+__all__ = [
+    "RoboDKFanucEnvironment",
+    "RoboDKObjectRecognitionExperiment",
+    "UnsafeMoveError",
+]

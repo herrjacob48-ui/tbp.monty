@@ -14,9 +14,11 @@ defaults:
   - _self_
 
 experiment:
-  _target_: tbp.monty.frameworks.experiments.object_recognition_experiments.MontyObjectRecognitionExperiment
+  _target_: tbp.monty.simulators.robodk.experiments.RoboDKObjectRecognitionExperiment
 
   config:
+    # Clear CLI logging differentiating training and evaluation phases.
+    cli_logging: true
     show_sensor_output: false
     do_train: true
     do_eval: true
@@ -40,6 +42,8 @@ experiment:
         max_total_steps: 2500
     environment:
       env_init_args:
+        object_names:
+          - cube
         check_motion_safety: true
         prescan_enabled: true
         prescan_output_path: ${experiment.config.logging.output_dir}/robodk_prescan.npz
