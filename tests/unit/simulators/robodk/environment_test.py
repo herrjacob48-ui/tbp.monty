@@ -781,6 +781,20 @@ def test_table_height_is_converted_from_station_to_robot_base_frame():
     assert table_height_mm == pytest.approx(80.0)
 
 
+def test_initialize_table_clearance_defaults_to_zero_without_table_reference():
+    env = make_environment()
+    env._initialize_table_clearance(
+        check_motion_safety=True,
+        table_height_mm=0.0,
+        table_reference_name=None,
+        camera_dimensions=np.asarray((100.0, 60.0, 50.0)),
+        table_clearance_mm=10.0,
+        prescan_enabled=False,
+    )
+    assert env.table_height_mm == 0.0
+    assert env.table_reference is None
+
+
 def test_camera_box_must_clear_table_by_configured_margin():
     env = make_environment(table_height_mm=100.0)
     env.max_step_mm = 100.0

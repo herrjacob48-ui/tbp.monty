@@ -108,7 +108,8 @@ class RoboDKFanucEnvironment:
         object_names: tuple[str, ...] | None = None,
         use_real_robot: bool = False,
         check_motion_safety: bool = True,
-        table_reference_name: str = "Object Inspection",
+        table_height_mm: float = 0.0,
+        table_reference_name: str | None = None,
         camera_dimensions_mm: tuple[float, float, float] = (100.0, 60.0, 50.0),
         table_clearance_mm: float = 10.0,
         max_step_mm: float = 200.0,
@@ -181,6 +182,7 @@ class RoboDKFanucEnvironment:
             if view_finder_id == self.sensor_id:
                 raise ValueError("patch and view-finder sensor IDs must be different")
             self.sensor_ids.append(view_finder_id)
+        self.table_height_mm = float(table_height_mm)
         self.table_reference_name = table_reference_name
         self.camera_dimensions_mm = camera_dimensions
         self.table_clearance_mm = table_clearance_mm
@@ -251,6 +253,7 @@ class RoboDKFanucEnvironment:
 
         self._initialize_table_clearance(
             check_motion_safety,
+            self.table_height_mm,
             table_reference_name,
             camera_dimensions,
             table_clearance_mm,
@@ -400,7 +403,8 @@ class RoboDKFanucEnvironment:
     def _initialize_table_clearance(
         self,
         check_motion_safety: bool,
-        table_reference_name: str,
+        table_height_mm: float,
+        table_reference_name: str | None,
         camera_dimensions: npt.NDArray[np.float64],
         table_clearance_mm: float,
         prescan_enabled: bool,
@@ -414,22 +418,28 @@ class RoboDKFanucEnvironment:
             )
             return
 
-        self.table_reference = self.rdk.Item(table_reference_name)
-        if not self.table_reference.Valid():
-            raise LookupError(
-                f"RoboDK table reference {table_reference_name!r} was not found"
+        if table_reference_name is not None:
+            self.table_reference = self.rdk.Item(table_reference_name)
+            if not self.table_reference.Valid():
+                raise LookupError(
+                    f"RoboDK table reference {table_reference_name!r} was not found"
+                )
+            self.table_height_mm = self._table_height_in_robot_base_mm(
+                self.robot, self.table_reference
             )
-        self.table_height_mm = self._table_height_in_robot_base_mm(
-            self.robot, self.table_reference
-        )
+            table_source = f"reference item {table_reference_name!r}"
+        else:
+            self.table_height_mm = float(table_height_mm)
+            table_source = "robot base Z=0 plane"
+
         if check_motion_safety:
             logger.warning(
-                "Using camera-only tabletop clearance: box %s mm, reference %r at "
-                "Z=%.1f mm, clearance %.1f mm. Camera dimensions are provisional; "
+                "Using camera-only tabletop clearance: box %s mm, table Z=%.1f mm "
+                "(from %s), clearance %.1f mm. Camera dimensions are provisional; "
                 "robot arm and mount collisions are not checked.",
                 tuple(float(size) for size in camera_dimensions),
-                table_reference_name,
                 self.table_height_mm,
+                table_source,
                 table_clearance_mm,
             )
 

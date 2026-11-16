@@ -15,7 +15,8 @@ env_init_args:
   - cube
   use_real_robot: false
   check_motion_safety: true
-  table_reference_name: Object Inspection
+  # Table height in robot-base coordinates (mm). Z=0 is the Fanuc base.
+  table_height_mm: 0.0
   # Camera enclosure dimensions (TCP-local X, Y, Z in mm).
   camera_dimensions_mm:
   - 100.0
