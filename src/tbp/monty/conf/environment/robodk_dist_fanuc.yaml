@@ -27,6 +27,8 @@ env_init_args:
   max_step_mm: 100.0
   # Enable prescan depth capture and workspace bounding box estimation.
   prescan_enabled: true
+  # Cycle to a different prescan viewpoint target on each episode reset.
+  cycle_prescan_views_on_reset: true
   prescan_center_xy_mm:
   - 650.0
   - -30.0

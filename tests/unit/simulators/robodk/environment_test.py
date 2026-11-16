@@ -235,6 +235,7 @@ def make_environment(
     prescan_aabb_below_base_mm=PRESCAN_AABB_BELOW_BASE_MM,
     prescan_aabb_safety_margin_mm=PRESCAN_AABB_SAFETY_MARGIN_MM,
     home_on_reset=False,
+    cycle_prescan_views_on_reset=False,
 ):
     env = RoboDKFanucEnvironment.__new__(RoboDKFanucEnvironment)
     env.resolution = (8, 6)
@@ -250,6 +251,8 @@ def make_environment(
     env.prescan_aabb_below_base_mm = prescan_aabb_below_base_mm
     env.prescan_aabb_safety_margin_mm = prescan_aabb_safety_margin_mm
     env.home_on_reset = home_on_reset
+    env.cycle_prescan_views_on_reset = cycle_prescan_views_on_reset
+    env._current_prescan_view_index = -1
     env.max_step_mm = 50.0
     env.prescan_enabled = False
     env.prescan_target_names = tuple(
@@ -1070,3 +1073,86 @@ def test_distant_agent_rotational_actions():
     assert env.robot.move_calls == 4
     assert env._last_action_feedback is not None
     assert env._last_action_feedback["status"] == "accepted"
+
+
+def test_reset_cycles_prescan_views_when_enabled():
+    class FakeItem:
+        def Visible(self):  # noqa: N802
+            return True
+
+        def PoseAbs(self):  # noqa: N802
+            return transl(650.0, -30.0, 0.0)
+
+    env = make_environment(cycle_prescan_views_on_reset=True)
+    env.prescan_enabled = True
+    env.object_names = ("cube",)
+    env._object_items = {"cube": FakeItem()}
+    targets = [
+        FakeTarget(transl(650.0, -30.0, 200.0)),
+        FakeTarget(transl(750.0, -30.0, 150.0)),
+        FakeTarget(transl(550.0, -30.0, 150.0)),
+    ]
+    env.prescan_targets = targets
+    env.prescan_target_names = ("Target 1", "Target 2", "Target 3")
+    env._prescanned_object_key = env._visible_prescan_object_key()
+
+    # Episode 0: moves to target 0
+    env.reset()
+    assert env.robot.move_j_calls == 1
+    assert env.robot.move_j_targets[-1] == targets[0]
+    assert env._current_prescan_view_index == 0
+
+    # Episode 1: moves to target 1
+    env.reset()
+    assert env.robot.move_j_calls == 2
+    assert env.robot.move_j_targets[-1] == targets[1]
+    assert env._current_prescan_view_index == 1
+
+    # Episode 2: moves to target 2
+    env.reset()
+    assert env.robot.move_j_calls == 3
+    assert env.robot.move_j_targets[-1] == targets[2]
+    assert env._current_prescan_view_index == 2
+
+    # Episode 3: wraps around back to target 0
+    env.reset()
+    assert env.robot.move_j_calls == 4
+    assert env.robot.move_j_targets[-1] == targets[0]
+    assert env._current_prescan_view_index == 0
+
+
+def test_reset_cycles_after_initial_prescan_run():
+    class FakeItem:
+        def Visible(self):  # noqa: N802
+            return True
+
+        def PoseAbs(self):  # noqa: N802
+            return transl(650.0, -30.0, 0.0)
+
+    env = make_environment(cycle_prescan_views_on_reset=True)
+    env.prescan_enabled = True
+    env.object_names = ("cube",)
+    env._object_items = {"cube": FakeItem()}
+    targets = [
+        FakeTarget(transl(650.0, -30.0, 200.0)),
+        FakeTarget(transl(750.0, -30.0, 150.0)),
+    ]
+    env.prescan_targets = targets
+    env.prescan_target_names = ("Target 1", "Target 2")
+
+    def run_prescan(object_key):
+        env._prescanned_object_key = object_key
+
+    env._run_prescan = run_prescan
+
+    # First reset runs prescan, then moves to target 0 for Episode 0
+    env.reset()
+    assert env.robot.move_j_calls == 1
+    assert env.robot.move_j_targets[-1] == targets[0]
+    assert env._current_prescan_view_index == 0
+
+    # Second reset does not re-run prescan, moves to target 1 for Episode 1
+    env.reset()
+    assert env.robot.move_j_calls == 2
+    assert env.robot.move_j_targets[-1] == targets[1]
+    assert env._current_prescan_view_index == 1

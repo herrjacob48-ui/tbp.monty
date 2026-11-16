@@ -140,6 +140,7 @@ class RoboDKFanucEnvironment:
         prescan_aabb_below_base_mm: float = PRESCAN_AABB_BELOW_BASE_MM,
         prescan_aabb_safety_margin_mm: float = PRESCAN_AABB_SAFETY_MARGIN_MM,
         home_on_reset: bool = False,
+        cycle_prescan_views_on_reset: bool = False,
         linear_speed_mm_s: float | None = None,
         joint_speed_deg_s: float | None = None,
     ):
@@ -210,6 +211,8 @@ class RoboDKFanucEnvironment:
         self.prescan_aabb_below_base_mm = float(prescan_aabb_below_base_mm)
         self.prescan_aabb_safety_margin_mm = float(prescan_aabb_safety_margin_mm)
         self.home_on_reset = bool(home_on_reset)
+        self.cycle_prescan_views_on_reset = bool(cycle_prescan_views_on_reset)
+        self._current_prescan_view_index = -1
         self.depth_provider = depth_provider
         self.require_depth = require_depth
         self.observation_output_dir = (
@@ -1552,8 +1555,34 @@ class RoboDKFanucEnvironment:
             if object_key is None:
                 if self._prescanned_object_key is None:
                     self.robot.MoveJ(self.home_joints)
-            elif object_key != self._prescanned_object_key:
-                self._run_prescan(object_key)
+            else:
+                if object_key != self._prescanned_object_key:
+                    self._run_prescan(object_key)
+                    self._current_prescan_view_index = -1
+                if self.cycle_prescan_views_on_reset and self.prescan_targets:
+                    self._current_prescan_view_index = (
+                        self._current_prescan_view_index + 1
+                    ) % len(self.prescan_targets)
+                    target = self.prescan_targets[self._current_prescan_view_index]
+                    target_name = (
+                        self.prescan_target_names[self._current_prescan_view_index]
+                        if self._current_prescan_view_index
+                        < len(self.prescan_target_names)
+                        else f"Target {self._current_prescan_view_index}"
+                    )
+                    try:
+                        self.robot.MoveJ(target)
+                        logger.info(
+                            "RoboDK reset: moved to prescan view %d/%d (%s).",
+                            self._current_prescan_view_index + 1,
+                            len(self.prescan_targets),
+                            target_name,
+                        )
+                    except TargetReachError as error:
+                        raise RuntimeError(
+                            f"RoboDK could not reach prescan target {target_name!r} "
+                            f"on episode reset: {error}"
+                        ) from error
         return self.get_observation(), self._state()
 
     def close(self) -> None:

@@ -23,7 +23,8 @@ experiment:
     max_train_steps: 100
     max_eval_steps: 100
     max_total_steps: 500
-    n_train_epochs: 3
+    # Train across all 6 prescan viewpoints around the object.
+    n_train_epochs: 6
     model_name_or_path: ""
     n_eval_epochs: 1
     min_lms_match: 1
