@@ -39,6 +39,10 @@ experiment:
         max_total_steps: 2500
     environment:
       env_init_args:
-        # Simulation-only convenience; the adapter rejects this in physical-robot mode.
-        check_motion_safety: false
+        # Simulation only, only controls checking against motion limits and table top dimensions.
+        check_motion_safety: true
+        # disable pre scan for no colllison checking.
+        prescan_enabled: true
+        prescan_output_path: ${experiment.config.logging.output_dir}/robodk_prescan.npz
         max_step_mm: 10.0
+        log_motion_collisions: false

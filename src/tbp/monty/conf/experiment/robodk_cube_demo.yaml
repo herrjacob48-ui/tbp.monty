@@ -38,5 +38,8 @@ experiment:
         max_total_steps: 20
     environment:
       env_init_args:
+        prescan_enabled: true
+        prescan_output_path: ${experiment.config.logging.output_dir}/robodk_prescan.npz
         max_step_mm: 2.0
         observation_output_dir: ${experiment.config.logging.output_dir}/camera_observations
+        log_motion_collisions: true

@@ -174,3 +174,27 @@ def test_accepted_action_clears_collision_recovery_state(monkeypatch):
     assert policy._consecutive_rejections == 0
     assert not policy._rejected_action_signatures
     assert not policy._recovery_mode
+
+
+def test_excessive_rejections_resets_recovery_state():
+    policy = make_policy()
+    rng = np.random.RandomState(0)
+    rejected = "SetAgentPose(location=(0.1, 0.2, 0.3))"
+    attempted_types = ["SetAgentPose"]
+    attempted_signatures = [rejected]
+
+    for _ in range(16):
+        result = policy(
+            SimpleNamespace(rng=rng),
+            rejected_observations(attempted_types[-1], attempted_signatures[-1]),
+            MotorSystemState(),
+            percept=None,
+            goal=None,
+        )
+        if result.actions:
+            action = result.actions[0]
+            attempted_types.append(type(action).__name__)
+            attempted_signatures.append(repr(action))
+
+    assert policy._consecutive_rejections == 0
+    assert not policy._recovery_mode

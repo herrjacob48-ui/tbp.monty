@@ -174,6 +174,18 @@ class RoboDKSurfacePolicyCurvatureInformed(SurfacePolicyCurvatureInformed):
         self._reset_jump_state()
         self._undo_action = None
 
+        if self._consecutive_rejections > 15:
+            logger.warning(
+                "Exceeded maximum consecutive RoboDK rejections (%d); "
+                "returning a no-motion step and resetting recovery state",
+                self._consecutive_rejections,
+            )
+            self._rejected_action_signatures.clear()
+            self._recovery_mode = False
+            self._consecutive_rejections = 0
+            self._telemetry = SurfacePolicyTelemetry()
+            return MotorPolicyResult(actions=[], telemetry=self._telemetry)
+
         action = self._sample_untried_alternative(
             ctx, action_type, exclude_signature=action_signature
         )

@@ -31,3 +31,8 @@ experiment:
     python_log_level: DEBUG
     logging:
       run_name: robodk_fanuc_train_eval_ltp
+    environment:
+      env_init_args:
+        prescan_enabled: true
+        prescan_output_path: ${experiment.config.logging.output_dir}/robodk_prescan.npz
+        log_motion_collisions: false

@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import quaternion as qt
 from PIL import Image
-from robodk.robolink import TargetReachError
+from robodk.robolink import StoppedError, TargetReachError
 from robodk.robomath import rotx, roty, transl
 
 from tbp.monty.frameworks.actions.actions import (
@@ -39,14 +39,18 @@ class FakeIKSolutions:
 
 
 class FakeCollisionItem:
-    def __init__(self):
+    def __init__(self, name="FakeItem"):
         self.valid = True
         self.pose = None
         self.mesh = None
         self.color = None
+        self.name = name
 
     def Valid(self):  # noqa: N802
         return self.valid
+
+    def Name(self):  # noqa: N802
+        return self.name
 
     def setPoseAbs(self, pose):  # noqa: N802
         self.pose = pose
@@ -105,7 +109,8 @@ class FakeRobot:
     def PoseFrame(self):  # noqa: N802
         return transl(0.0, 0.0, 0.0)
 
-    def MoveL_Test(self, joints, pose):  # noqa: N802
+    def MoveL_Test(self, joints, pose, minstep_mm=-1):  # noqa: N802
+        del minstep_mm
         self.move_test_calls += 1
         self.move_test_joint_starts.append(list(joints))
         self._pose_before_move_test = self.pose
@@ -179,9 +184,10 @@ class FakeRoboDK:
         self.collision_enabled = False
         self.collision_pairs = []
         self.collision_shapes = []
+        self.station_collision_pairs = []
 
     def AddShape(self, mesh):  # noqa: N802
-        item = FakeCollisionItem()
+        item = FakeCollisionItem(name="AABB_Item")
         item.mesh = mesh
         self.collision_shapes.append(item)
         return item
@@ -193,6 +199,12 @@ class FakeRoboDK:
     def setCollisionActivePair(self, state, item1, item2, id1=0, id2=0):  # noqa: N802
         self.collision_pairs.append((state, item1, item2, id1, id2))
         return 1
+
+    def Collisions(self):  # noqa: N802
+        return len(self.station_collision_pairs)
+
+    def CollisionPairs(self):  # noqa: N802
+        return list(self.station_collision_pairs)
 
     def Cam2D_Snapshot(self, _path, _camera, params=""):  # noqa: N802
         if params == "Depth":
@@ -213,6 +225,11 @@ def make_environment(
     observation_output_dir=None,
     table_height_mm=0.0,
     check_motion_safety=True,
+    log_motion_collisions=False,
+    check_aabb_collisions=True,
+    path_test_step_mm=2.0,
+    prescan_aabb_below_base_mm=PRESCAN_AABB_BELOW_BASE_MM,
+    home_on_reset=False,
 ):
     env = RoboDKFanucEnvironment.__new__(RoboDKFanucEnvironment)
     env.resolution = (8, 6)
@@ -223,6 +240,10 @@ def make_environment(
     env.table_clearance_mm = 10.0
     env.table_height_mm = table_height_mm
     env.check_motion_safety = check_motion_safety
+    env.check_aabb_collisions = check_aabb_collisions
+    env.path_test_step_mm = path_test_step_mm
+    env.prescan_aabb_below_base_mm = prescan_aabb_below_base_mm
+    env.home_on_reset = home_on_reset
     env.max_step_mm = 50.0
     env.prescan_enabled = False
     env.prescan_target_names = tuple(
@@ -239,6 +260,7 @@ def make_environment(
     env._prescan_aabb_item = None
     env._prescan_aabb_link_ids = ()
     env._prescan_aabb_tool = None
+    env._prescan_aabb_camera = None
     env._prescanned_object_key = None
     env._camera_hfov_degrees = None
     env.depth_provider = depth_provider
@@ -258,6 +280,8 @@ def make_environment(
     env.robot = FakeRobot()
     env.table_reference = FakeTableReference(table_height_mm)
     env.home_joints = []
+    env.log_motion_collisions = log_motion_collisions
+    env.log_collisions = log_motion_collisions
     return env
 
 
@@ -891,3 +915,138 @@ def test_fixed_camera_rejects_nonidentity_sensor_rotation():
                 )
             ]
         )
+
+
+def test_movel_test_collision_logging(capsys):
+    env = make_environment(log_motion_collisions=True)
+    aabb_item = FakeCollisionItem(name="prescan_aabb")
+    env._prescan_aabb_item = aabb_item
+    env.robot.move_test_result = 1
+    env.rdk.station_collision_pairs = [[env.robot, aabb_item, 5, 0]]
+
+    with pytest.raises(UnsafeMoveError, match="collision pair"):
+        env._move_to_pose(transl(510.0, 0.0, 200.0))
+
+    captured = capsys.readouterr()
+    assert "[RoboDK MoveL_Test REJECTED - COLLISION]" in captured.out
+    assert "[AABB COLLISION DETECTED]" in captured.out
+    assert "prescan_aabb" in captured.out
+
+
+def test_movel_post_move_collision_logging(capsys):
+    env = make_environment(log_motion_collisions=True)
+    aabb_item = FakeCollisionItem(name="prescan_aabb")
+    env._prescan_aabb_item = aabb_item
+    env.robot.move_test_result = 0
+
+    def trigger_collision_on_movel(pose):
+        env.rdk.station_collision_pairs = [[env.robot, aabb_item, 5, 0]]
+        env.robot.moved_pose = pose
+
+    env.robot.MoveL = trigger_collision_on_movel
+
+    env._move_to_pose(transl(510.0, 0.0, 200.0))
+
+    captured = capsys.readouterr()
+    assert "[RoboDK MoveL_Test PASSED]" in captured.out
+    assert "[RoboDK MoveL COLLISION OCCURRED]" in captured.out
+    assert "[CRITICAL: COLLIDED WITH PRESCAN AABB!]" in captured.out
+    assert "MoveL_Test previously passed" in captured.out
+
+
+def test_movel_exception_logging(capsys):
+    env = make_environment(log_motion_collisions=True)
+    aabb_item = FakeCollisionItem(name="prescan_aabb")
+    env._prescan_aabb_item = aabb_item
+    env.robot.move_test_result = 0
+
+    def fail_movel(_pose):
+        env.rdk.station_collision_pairs = [[env.robot, aabb_item, 5, 0]]
+        raise RuntimeError("RoboDK simulation stopped due to collision")
+
+    env.robot.MoveL = fail_movel
+
+    with pytest.raises(RuntimeError, match="simulation stopped"):
+        env._move_to_pose(transl(510.0, 0.0, 200.0))
+
+    captured = capsys.readouterr()
+    assert "[RoboDK MoveL HALTED / EXCEPTION]" in captured.out
+    assert "[CRITICAL: COLLIDED WITH PRESCAN AABB!]" in captured.out
+
+
+def test_movel_logging_deactivated(capsys):
+    env = make_environment(log_motion_collisions=False)
+    aabb_item = FakeCollisionItem(name="prescan_aabb")
+    env._prescan_aabb_item = aabb_item
+    env.robot.move_test_result = 1
+    env.rdk.station_collision_pairs = [[env.robot, aabb_item, 5, 0]]
+
+    with pytest.raises(UnsafeMoveError, match="collision pair"):
+        env._move_to_pose(transl(510.0, 0.0, 200.0))
+
+    captured = capsys.readouterr()
+    assert "[RoboDK" not in captured.out
+
+
+def test_environment_init_log_motion_collisions_flag():
+    env1 = RoboDKFanucEnvironment.__new__(RoboDKFanucEnvironment)
+    env1.rdk = FakeRoboDK()
+    env1.robot = FakeRobot()
+    env1.table_reference = FakeTableReference()
+    env1.log_motion_collisions = False
+    env1._log_motion("test_hidden")
+    assert env1.log_motion_collisions is False
+
+    env2 = RoboDKFanucEnvironment.__new__(RoboDKFanucEnvironment)
+    env2.rdk = FakeRoboDK()
+    env2.robot = FakeRobot()
+    env2.table_reference = FakeTableReference()
+    env2.log_motion_collisions = True
+    assert env2.log_motion_collisions is True
+
+
+def test_stopped_error_converts_to_unsafe_move_error():
+    env = make_environment()
+    env.robot.move_test_result = 0
+
+    def raise_stopped(_pose):
+        raise StoppedError("Robot motion stopped by collision")
+
+    env.robot.MoveL = raise_stopped
+
+    with pytest.raises(UnsafeMoveError, match="halted due to collision") as exc_info:
+        env._move_to_pose(transl(510.0, 0.0, 200.0))
+    assert exc_info.value.failure_type == "collision"
+
+
+def test_deactivate_aabb_collision_checking():
+    env = make_environment(check_motion_safety=False, check_aabb_collisions=False)
+    aabb_item = FakeCollisionItem(name="prescan_aabb")
+    env._prescan_aabb_item = aabb_item
+    env.robot.move_test_result = 1  # Would fail if checked!
+
+    # Should not raise UnsafeMoveError because both safety checks are disabled
+    env._move_to_pose(transl(510.0, 0.0, 200.0))
+    assert env.robot.move_test_calls == 0
+    assert env.robot.move_calls == 1
+
+
+def test_reset_with_home_on_reset_moves_to_home_joints():
+    env = make_environment(home_on_reset=True)
+    env.home_joints = [10.0, 20.0, 30.0]
+    env.prescan_enabled = True
+    env._prescanned_object_key = ("cube", (0.0,))
+
+    env.reset()
+    assert env.robot.move_j_calls == 1
+    assert env.robot.move_j_targets == [[10.0, 20.0, 30.0]]
+
+
+def test_reset_without_home_on_reset_preserves_prescan_caching():
+    env = make_environment(home_on_reset=False)
+    env.home_joints = [10.0, 20.0, 30.0]
+    env.prescan_enabled = True
+    env._prescanned_object_key = ("cube", (0.0,))
+
+    env.reset()
+    assert env.robot.move_j_calls == 0

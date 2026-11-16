@@ -12,8 +12,12 @@ import copy
 import io
 import json
 import logging
+import socket
+import struct
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+import socket
+import struct
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 import numpy.typing as npt
@@ -31,6 +35,7 @@ from robodk.robolink import (
     RUNMODE_SIMULATE,
     Item,
     Robolink,
+    StoppedError,
     TargetReachError,
 )
 from robodk.robomath import Mat, rotx, roty, transl
@@ -104,7 +109,7 @@ class RoboDKFanucEnvironment:
         table_reference_name: str = "Object Inspection",
         camera_dimensions_mm: tuple[float, float, float] = (100.0, 60.0, 50.0),
         table_clearance_mm: float = 10.0,
-        max_step_mm: float = 50.0,
+        max_step_mm: float = 200.0,
         prescan_enabled: bool = False,
         prescan_target_names: tuple[str, ...] = (
             "Monty Prescan View",
@@ -126,6 +131,14 @@ class RoboDKFanucEnvironment:
         depth_provider: DepthProvider | None = None,
         require_depth: bool = False,
         observation_output_dir: str | Path | None = None,
+        log_motion_collisions: bool = False,
+        log_collisions: bool | None = None,
+        check_aabb_collisions: bool = True,
+        path_test_step_mm: float = 2.0,
+        prescan_aabb_below_base_mm: float = PRESCAN_AABB_BELOW_BASE_MM,
+        home_on_reset: bool = False,
+        linear_speed_mm_s: float | None = None,
+        joint_speed_deg_s: float | None = None,
     ):
         self._validate_motion_safety_mode(use_real_robot, check_motion_safety)
         resolution = self._validate_resolution(resolution)
@@ -188,6 +201,11 @@ class RoboDKFanucEnvironment:
         self._prescan_aabb_item: Item | None = None
         self._prescan_aabb_link_ids: tuple[int, ...] = ()
         self._prescan_aabb_tool: Item | None = None
+        self._prescan_aabb_camera: Item | None = None
+        self.check_aabb_collisions = check_aabb_collisions
+        self.path_test_step_mm = float(path_test_step_mm)
+        self.prescan_aabb_below_base_mm = float(prescan_aabb_below_base_mm)
+        self.home_on_reset = bool(home_on_reset)
         self.depth_provider = depth_provider
         self.require_depth = require_depth
         self.observation_output_dir = (
@@ -195,6 +213,10 @@ class RoboDKFanucEnvironment:
         )
         self._observation_count = 0
         self._last_action_feedback: dict[str, str] | None = None
+        if log_collisions is not None:
+            log_motion_collisions = log_collisions
+        self.log_motion_collisions = bool(log_motion_collisions)
+        self.log_collisions = self.log_motion_collisions
         if self.observation_output_dir is not None:
             self.observation_output_dir.mkdir(parents=True, exist_ok=True)
             logger.info(
@@ -234,8 +256,14 @@ class RoboDKFanucEnvironment:
         if not self.camera.Valid():
             raise LookupError(f"RoboDK camera {camera_name!r} was not found")
 
-        self.robot.setSpeedJoints(15 if use_real_robot else 45)
-        self.robot.setSpeed(30 if use_real_robot else 100)
+        default_joint_speed = 15 if use_real_robot else 45
+        default_linear_speed = 30 if use_real_robot else 100
+        self.robot.setSpeedJoints(
+            joint_speed_deg_s if joint_speed_deg_s is not None else default_joint_speed
+        )
+        self.robot.setSpeed(
+            linear_speed_mm_s if linear_speed_mm_s is not None else default_linear_speed
+        )
         self.home_joints = self.robot.Joints()
 
         self._object_items: dict[str, Item] = {}
@@ -411,6 +439,24 @@ class RoboDKFanucEnvironment:
                     break
         except OSError as error:
             logger.debug("Could not read the configured DNS server: %s", error)
+
+        try:
+            with Path("/proc/net/route").open() as route_file:
+                for line in route_file:
+                    fields = line.strip().split()
+                    if len(fields) >= 3 and fields[1] == "00000000":
+                        gateway_ip = socket.inet_ntoa(
+                            struct.pack("<L", int(fields[2], 16))
+                        )
+                        if (
+                            gateway_ip
+                            and not gateway_ip.startswith("127.")
+                            and gateway_ip not in candidates
+                        ):
+                            candidates.insert(0, gateway_ip)
+                        break
+        except (OSError, ValueError):
+            pass
 
         for ip in candidates:
             rdk = Robolink(robodk_ip=ip, port=20500)
@@ -589,7 +635,9 @@ class RoboDKFanucEnvironment:
         )
         estimate_min -= PRESCAN_AABB_SAFETY_MARGIN_MM
         estimate_max += PRESCAN_AABB_SAFETY_MARGIN_MM
-        estimate_min[2] = -PRESCAN_AABB_BELOW_BASE_MM - PRESCAN_AABB_SAFETY_MARGIN_MM
+        estimate_min[2] = (
+            -self.prescan_aabb_below_base_mm - PRESCAN_AABB_SAFETY_MARGIN_MM
+        )
         estimated_dimensions = estimate_max - estimate_min
         if not np.isfinite(estimated_dimensions).all() or np.any(
             estimated_dimensions <= 0
@@ -730,10 +778,15 @@ class RoboDKFanucEnvironment:
             self.rdk.setCollisionActivePair(
                 COLLISION_OFF, self._prescan_aabb_tool, self._prescan_aabb_item
             )
+        if self._prescan_aabb_camera is not None:
+            self.rdk.setCollisionActivePair(
+                COLLISION_OFF, self._prescan_aabb_camera, self._prescan_aabb_item
+            )
         self._prescan_aabb_item.Delete()
         self._prescan_aabb_item = None
         self._prescan_aabb_link_ids = ()
         self._prescan_aabb_tool = None
+        self._prescan_aabb_camera = None
 
     def _set_prescan_collision_aabb(
         self,
@@ -792,6 +845,17 @@ class RoboDKFanucEnvironment:
                     "robot tool against the prescan AABB"
                 )
             self._prescan_aabb_tool = tool
+            if (
+                self.camera is not None
+                and hasattr(self.camera, "Valid")
+                and self.camera.Valid()
+                and self.camera != tool
+                and self.rdk.setCollisionActivePair(
+                    COLLISION_ON, self.camera, aabb_item
+                )
+                == 1
+            ):
+                self._prescan_aabb_camera = self.camera
             configured = True
         finally:
             if not configured:
@@ -965,7 +1029,10 @@ class RoboDKFanucEnvironment:
         )
 
     def is_move_safe(self, target_pose: Mat) -> bool:
-        if not self.check_motion_safety and self._prescan_aabb_item is None:
+        has_aabb_check = (
+            self.check_aabb_collisions and self._prescan_aabb_item is not None
+        )
+        if not self.check_motion_safety and not has_aabb_check:
             return True
         if self.check_motion_safety:
             if self.table_height_mm is None:
@@ -978,10 +1045,119 @@ class RoboDKFanucEnvironment:
                 return False
         return self._test_linear_path(target_pose) == 0
 
+    @staticmethod
+    def _item_name(item: Any) -> str:
+        if item is None:
+            return "None"
+        if hasattr(item, "Name"):
+            try:
+                name = item.Name()
+                if isinstance(name, str) and name:
+                    return name
+            except (AttributeError, RuntimeError):
+                return repr(item)
+        return repr(item)
+
+    def _is_aabb_item(self, item: Any) -> bool:
+        if item is None:
+            return False
+        if self._prescan_aabb_item is not None:
+            try:
+                if item == self._prescan_aabb_item:
+                    return True
+            except (AttributeError, TypeError, ValueError):
+                pass
+        name = self._item_name(item).lower()
+        return "aabb" in name
+
+    def _station_collisions(self) -> list[str]:
+        """Query RoboDK for currently active collision pairs.
+
+        Returns:
+            A list of human-readable collision pair descriptions.
+        """
+        if not hasattr(self.rdk, "Collisions"):
+            return []
+        try:
+            count = self.rdk.Collisions()
+        except (AttributeError, RuntimeError):
+            return []
+        if count <= 0:
+            return []
+
+        descriptions: list[str] = []
+        if hasattr(self.rdk, "CollisionPairs"):
+            try:
+                pairs = self.rdk.CollisionPairs()
+                for pair in pairs:
+                    if len(pair) >= 2:
+                        item1, item2 = pair[0], pair[1]
+                        id1 = pair[2] if len(pair) > 2 else 0
+                        id2 = pair[3] if len(pair) > 3 else 0
+                        name1 = self._item_name(item1)
+                        name2 = self._item_name(item2)
+                        is_aabb = (
+                            self._is_aabb_item(item1) or self._is_aabb_item(item2)
+                        )
+                        aabb_flag = " [AABB COLLISION]" if is_aabb else ""
+                        descriptions.append(
+                            f"({name1} [link {id1}] <-> "
+                            f"{name2} [link {id2}]){aabb_flag}"
+                        )
+            except (AttributeError, RuntimeError) as exc:
+                descriptions.append(f"Error querying CollisionPairs: {exc}")
+
+        if not descriptions:
+            descriptions.append(f"{count} colliding pair(s) detected")
+        return descriptions
+
+    def _log_motion(self, message: str) -> None:
+        """Print motion and collision messages to stdout if logging is activated."""
+        if self.log_motion_collisions:
+            print(message, flush=True)
+
     def _test_linear_path(self, target_pose: Mat) -> int:
         start_joints = self._joint_values(self.robot.Joints())
+        start_pos = tuple(round(p, 1) for p in self.robot.Pose().Pos())
+        target_pos = tuple(round(p, 1) for p in target_pose.Pos())
+        self._log_motion(
+            f"[RoboDK MoveL_Test] Checking linear path: "
+            f"{start_pos} -> {target_pos} mm..."
+        )
         try:
-            return self.robot.MoveL_Test(start_joints, target_pose)
+            step_mm = self.path_test_step_mm if self.path_test_step_mm > 0 else -1.0
+            result = self.robot.MoveL_Test(
+                start_joints, target_pose, minstep_mm=step_mm
+            )
+            if result > 0:
+                collisions = self._station_collisions()
+                collision_str = "; ".join(collisions) if collisions else "none reported"
+                has_aabb = any("[AABB COLLISION]" in c for c in collisions)
+                aabb_flag = " [AABB COLLISION DETECTED]" if has_aabb else ""
+                self._log_motion(
+                    f"[RoboDK MoveL_Test REJECTED - COLLISION]{aabb_flag} "
+                    f"MoveL_Test found {result} collision pair(s) between "
+                    f"{start_pos} and {target_pos}! Colliding pairs: {collision_str}"
+                )
+                logger.warning(
+                    "MoveL_Test detected %d collision pair(s) from %s to %s. Pairs: %s",
+                    result,
+                    start_pos,
+                    target_pos,
+                    collision_str,
+                )
+            elif result < 0:
+                self._log_motion(
+                    f"[RoboDK MoveL_Test REJECTED - INFEASIBLE] MoveL_Test "
+                    f"returned {result} (unreachable/non-linear) for path "
+                    f"{start_pos} -> {target_pos}."
+                )
+            else:
+                self._log_motion(
+                    f"[RoboDK MoveL_Test PASSED] Path {start_pos} -> {target_pos} "
+                    f"is collision-free (result: 0)."
+                )
+            return result
         finally:
             self.robot.setJoints(start_joints)
 
@@ -1068,7 +1244,10 @@ class RoboDKFanucEnvironment:
                     f"{self.table_clearance_mm:.1f} mm clearance",
                     failure_type="table_clearance",
                 )
-        if self.check_motion_safety or self._prescan_aabb_item is not None:
+        has_aabb_check = (
+            self.check_aabb_collisions and self._prescan_aabb_item is not None
+        )
+        if self.check_motion_safety or has_aabb_check:
             motion_test_result = self._test_linear_path(target_pose)
             if motion_test_result > 0:
                 raise UnsafeMoveError(
@@ -1082,7 +1261,67 @@ class RoboDKFanucEnvironment:
                     "or infeasible; choose a different action",
                     failure_type="path",
                 )
-        self.robot.MoveL(target_pose)
+
+        target_pos = tuple(round(p, 1) for p in target_pose.Pos())
+        start_pos = tuple(round(p, 1) for p in self.robot.Pose().Pos())
+        self._log_motion(
+            f"[RoboDK MoveL] Executing actual MoveL: "
+            f"{start_pos} -> {target_pos} mm..."
+        )
+        try:
+            self.robot.MoveL(target_pose)
+        except StoppedError as exc:
+            collisions = self._station_collisions()
+            collision_str = "; ".join(collisions) if collisions else "none reported"
+            has_aabb = any("[AABB COLLISION]" in c for c in collisions)
+            aabb_alert = " [CRITICAL: COLLIDED WITH PRESCAN AABB!]" if has_aabb else ""
+            self._log_motion(
+                f"[RoboDK MoveL STOPPED / COLLISION]{aabb_alert} Robot motion stopped "
+                f"by RoboDK collision halt: {exc}. Active collisions: {collision_str}"
+            )
+            raise UnsafeMoveError(
+                f"RoboDK motion halted due to collision: {exc}. "
+                f"Active collisions: {collision_str}",
+                failure_type="collision",
+            ) from exc
+        except Exception as exc:
+            collisions = self._station_collisions()
+            collision_str = "; ".join(collisions) if collisions else "none reported"
+            has_aabb = any("[AABB COLLISION]" in c for c in collisions)
+            aabb_alert = " [CRITICAL: COLLIDED WITH PRESCAN AABB!]" if has_aabb else ""
+            self._log_motion(
+                f"[RoboDK MoveL HALTED / EXCEPTION]{aabb_alert} Actual MoveL stopped "
+                f"with exception: {type(exc).__name__}: {exc}. "
+                f"Active collisions: {collision_str}"
+            )
+            logger.exception(
+                "Exception during actual MoveL to %s. Active collisions: %s",
+                target_pos,
+                collision_str,
+            )
+            raise
+
+        post_move_collisions = self._station_collisions()
+        if post_move_collisions:
+            collision_str = "; ".join(post_move_collisions)
+            has_aabb = any("[AABB COLLISION]" in c for c in post_move_collisions)
+            aabb_alert = " [CRITICAL: COLLIDED WITH PRESCAN AABB!]" if has_aabb else ""
+            self._log_motion(
+                f"[RoboDK MoveL COLLISION OCCURRED]{aabb_alert} Actual MoveL "
+                f"completed, but RoboDK station reports "
+                f"{len(post_move_collisions)} active collision(s)! "
+                f"Colliding pairs: {collision_str} "
+                f"(WARNING: MoveL_Test previously passed with 0 collisions!)"
+            )
+            logger.error(
+                "Collision detected AFTER actual MoveL to %s! Pairs: %s",
+                target_pos,
+                collision_str,
+            )
+        else:
+            self._log_motion(
+                f"[RoboDK MoveL SUCCESS] Reached {target_pos} mm with 0 collisions."
+            )
 
     @staticmethod
     def _rotation_matrix(rotation_quat_wxyz: Sequence[float]) -> Mat:
@@ -1156,6 +1395,9 @@ class RoboDKFanucEnvironment:
                 )
             try:
                 action.act(self)
+                self._log_motion(
+                    f"[RoboDK Step ACCEPTED] Action {type(action).__name__} succeeded."
+                )
             except UnsafeMoveError as error:
                 self._last_action_feedback = {
                     "status": "rejected",
@@ -1165,6 +1407,10 @@ class RoboDKFanucEnvironment:
                     "action_signature": repr(action),
                     "message": str(error),
                 }
+                self._log_motion(
+                    f"[RoboDK Step REJECTED] Action {type(action).__name__} "
+                    f"rejected: {error}"
+                )
                 logger.warning(
                     "Rejected unsafe %s action; robot did not move: %s",
                     type(action).__name__,
@@ -1179,6 +1425,10 @@ class RoboDKFanucEnvironment:
                     "action_signature": repr(action),
                     "message": str(error),
                 }
+                self._log_motion(
+                    f"[RoboDK Step REJECTED] Action {type(action).__name__} "
+                    f"unreachable: {error}"
+                )
                 logger.warning(
                     "RoboDK could not reach the target for %s; robot did not move: %s",
                     type(action).__name__,
@@ -1271,7 +1521,7 @@ class RoboDKFanucEnvironment:
 
     def reset(self) -> tuple[Observations, ProprioceptiveState]:
         self._last_action_feedback = None
-        if not self.prescan_enabled:
+        if self.home_on_reset or not self.prescan_enabled:
             self.robot.MoveJ(self.home_joints)
         else:
             object_key = self._visible_prescan_object_key()

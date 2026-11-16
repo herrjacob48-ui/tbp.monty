@@ -16,11 +16,40 @@ env_init_args:
   use_real_robot: false
   check_motion_safety: true
   table_reference_name: Object Inspection
-  # Provisional camera enclosure dimensions (TCP-local X, Y, Z); measure before lab use.
+  # TODO: measure before lab use.
   camera_dimensions_mm:
   - 100.0
   - 60.0
   - 50.0
   table_clearance_mm: 10.0
   max_step_mm: 50.0
+  # Enable only after confirming the scan workspace and route are clear in simulation.
+  prescan_enabled: true
+  prescan_center_xy_mm:
+  - 650.0
+  - -30.0
+  # Create, position, and orient each target in RoboDK; order defines scan order.
+  prescan_target_names:
+  - Monty Prescan View
+  - Monty Prescan View 2
+  - Monty Prescan View 3
+  - Monty Prescan View 4
+  - Monty Prescan View 5
+  - Monty Prescan View 6
+  # Cube placement origin is its bottom center in robot-base coordinates.
+  prescan_object_bottom_z_mm: 131.75
+  prescan_max_object_dimensions_mm:
+  - 300.0
+  - 300.0
+  - 300.0
+  prescan_center_tolerance_mm: 100.0
   require_depth: true
+  # Toggle command-line logging for MoveL_Test and MoveL collision detection.
+  log_motion_collisions: false
+  # Enable collision checking against the post-prescan estimated AABB mesh.
+  check_aabb_collisions: true
+  # Discretization step (mm) for MoveL_Test linear path collision checking.
+  path_test_step_mm: 2.0
+  # Robot joint and linear speeds (null uses default 45 deg/s and 100 mm/s in simulation).
+  joint_speed_deg_s: null
+  linear_speed_mm_s: null
