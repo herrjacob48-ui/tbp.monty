@@ -1,0 +1,59 @@
+# @package experiment.config.environment
+
+env_init_func: ${monty.class:tbp.monty.simulators.robodk.environment.RoboDKFanucEnvironment}
+env_init_args:
+  robot_name: Fanuc CRX-10iA
+  camera_name: Camera 1
+  resolution:
+  - 64
+  - 64
+  agent_id: agent_id_0
+  sensor_id: patch
+  view_finder_sensor_id: view_finder
+  # Import each model into the RoboDK station and use its exact item tree name.
+  object_names:
+  - cube
+  use_real_robot: false
+  check_motion_safety: true
+  table_reference_name: Object Inspection
+  # Camera enclosure dimensions (TCP-local X, Y, Z in mm).
+  camera_dimensions_mm:
+  - 100.0
+  - 60.0
+  - 50.0
+  # Increased table clearance for distant agent observing the workspace.
+  table_clearance_mm: 30.0
+  # Larger step size for distant agent viewpoint transitions.
+  max_step_mm: 100.0
+  # Enable prescan depth capture and workspace bounding box estimation.
+  prescan_enabled: true
+  prescan_center_xy_mm:
+  - 650.0
+  - -30.0
+  # Create, position, and orient each target in RoboDK; order defines scan order.
+  prescan_target_names:
+  - Monty Prescan View
+  - Monty Prescan View 2
+  - Monty Prescan View 3
+  - Monty Prescan View 4
+  - Monty Prescan View 5
+  - Monty Prescan View 6
+  # Cube placement origin in robot-base coordinates.
+  prescan_object_bottom_z_mm: -113.5
+  prescan_max_object_dimensions_mm:
+  - 300.0
+  - 300.0
+  - 300.0
+  prescan_center_tolerance_mm: 100.0
+  require_depth: true
+  # Generous safety margin (mm) keeping the distant agent outside the object AABB.
+  prescan_aabb_safety_margin_mm: 25.0
+  # Toggle command-line logging for MoveL_Test and MoveL collision detection.
+  log_motion_collisions: false
+  # Enable collision checking against the post-prescan estimated AABB mesh.
+  check_aabb_collisions: true
+  # Discretization step (mm) for MoveL_Test linear path collision checking.
+  path_test_step_mm: 2.0
+  # Robot joint and linear speeds (null uses default 45 deg/s and 100 mm/s in simulation).
+  joint_speed_deg_s: null
+  linear_speed_mm_s: null

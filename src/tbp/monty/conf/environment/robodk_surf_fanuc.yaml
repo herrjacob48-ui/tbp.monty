@@ -37,13 +37,15 @@ env_init_args:
   - Monty Prescan View 5
   - Monty Prescan View 6
   # Cube placement origin is its bottom center in robot-base coordinates.
-  prescan_object_bottom_z_mm: 131.75
+  prescan_object_bottom_z_mm: -113.5
   prescan_max_object_dimensions_mm:
   - 300.0
   - 300.0
   - 300.0
   prescan_center_tolerance_mm: 100.0
   require_depth: true
+  # Safety margin (mm) expanded around the estimated prescan AABB on all sides.
+  prescan_aabb_safety_margin_mm: 10.0
   # Toggle command-line logging for MoveL_Test and MoveL collision detection.
   log_motion_collisions: false
   # Enable collision checking against the post-prescan estimated AABB mesh.

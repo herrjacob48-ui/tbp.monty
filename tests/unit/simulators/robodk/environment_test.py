@@ -229,6 +229,7 @@ def make_environment(
     check_aabb_collisions=True,
     path_test_step_mm=2.0,
     prescan_aabb_below_base_mm=PRESCAN_AABB_BELOW_BASE_MM,
+    prescan_aabb_safety_margin_mm=PRESCAN_AABB_SAFETY_MARGIN_MM,
     home_on_reset=False,
 ):
     env = RoboDKFanucEnvironment.__new__(RoboDKFanucEnvironment)
@@ -243,6 +244,7 @@ def make_environment(
     env.check_aabb_collisions = check_aabb_collisions
     env.path_test_step_mm = path_test_step_mm
     env.prescan_aabb_below_base_mm = prescan_aabb_below_base_mm
+    env.prescan_aabb_safety_margin_mm = prescan_aabb_safety_margin_mm
     env.home_on_reset = home_on_reset
     env.max_step_mm = 50.0
     env.prescan_enabled = False

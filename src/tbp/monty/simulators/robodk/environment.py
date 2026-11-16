@@ -15,8 +15,6 @@ import logging
 import socket
 import struct
 from pathlib import Path
-import socket
-import struct
 from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
@@ -136,6 +134,7 @@ class RoboDKFanucEnvironment:
         check_aabb_collisions: bool = True,
         path_test_step_mm: float = 2.0,
         prescan_aabb_below_base_mm: float = PRESCAN_AABB_BELOW_BASE_MM,
+        prescan_aabb_safety_margin_mm: float = PRESCAN_AABB_SAFETY_MARGIN_MM,
         home_on_reset: bool = False,
         linear_speed_mm_s: float | None = None,
         joint_speed_deg_s: float | None = None,
@@ -205,6 +204,7 @@ class RoboDKFanucEnvironment:
         self.check_aabb_collisions = check_aabb_collisions
         self.path_test_step_mm = float(path_test_step_mm)
         self.prescan_aabb_below_base_mm = float(prescan_aabb_below_base_mm)
+        self.prescan_aabb_safety_margin_mm = float(prescan_aabb_safety_margin_mm)
         self.home_on_reset = bool(home_on_reset)
         self.depth_provider = depth_provider
         self.require_depth = require_depth
@@ -633,10 +633,10 @@ class RoboDKFanucEnvironment:
         estimate_max[2] = min(
             estimate_max[2], self.prescan_object_bottom_z_mm + dimensions[2]
         )
-        estimate_min -= PRESCAN_AABB_SAFETY_MARGIN_MM
-        estimate_max += PRESCAN_AABB_SAFETY_MARGIN_MM
+        estimate_min -= self.prescan_aabb_safety_margin_mm
+        estimate_max += self.prescan_aabb_safety_margin_mm
         estimate_min[2] = (
-            -self.prescan_aabb_below_base_mm - PRESCAN_AABB_SAFETY_MARGIN_MM
+            -self.prescan_aabb_below_base_mm - self.prescan_aabb_safety_margin_mm
         )
         estimated_dimensions = estimate_max - estimate_min
         if not np.isfinite(estimated_dimensions).all() or np.any(
