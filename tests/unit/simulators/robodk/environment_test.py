@@ -18,12 +18,16 @@ from robodk.robolink import StoppedError, TargetReachError
 from robodk.robomath import rotx, roty, transl
 
 from tbp.monty.frameworks.actions.actions import (
+    LookDown,
+    LookUp,
     MoveForward,
     MoveTangentially,
     OrientHorizontal,
     OrientVertical,
     SetAgentPose,
     SetSensorRotation,
+    TurnLeft,
+    TurnRight,
 )
 from tbp.monty.simulators.robodk.environment import (
     PRESCAN_AABB_BELOW_BASE_MM,
@@ -1052,3 +1056,17 @@ def test_reset_without_home_on_reset_preserves_prescan_caching():
 
     env.reset()
     assert env.robot.move_j_calls == 0
+
+
+def test_distant_agent_rotational_actions():
+    env = make_environment()
+    actions = [
+        LookDown(agent_id="agent_id_0", rotation_degrees=5.0),
+        LookUp(agent_id="agent_id_0", rotation_degrees=5.0),
+        TurnLeft(agent_id="agent_id_0", rotation_degrees=5.0),
+        TurnRight(agent_id="agent_id_0", rotation_degrees=5.0),
+    ]
+    env.step(actions)
+    assert env.robot.move_calls == 4
+    assert env._last_action_feedback is not None
+    assert env._last_action_feedback["status"] == "accepted"

@@ -41,12 +41,16 @@ from scipy.spatial.transform import Rotation, Slerp
 
 from tbp.monty.frameworks.actions.actions import (
     Action,
+    LookDown,
+    LookUp,
     MoveForward,
     MoveTangentially,
     OrientHorizontal,
     OrientVertical,
     SetAgentPose,
     SetSensorRotation,
+    TurnLeft,
+    TurnRight,
 )
 from tbp.monty.frameworks.agents import AgentID
 from tbp.monty.frameworks.environments.environment import (
@@ -1374,12 +1378,16 @@ class RoboDKFanucEnvironment:
             NotImplementedError: If the action type is unsupported by this adapter.
         """
         supported_actions = (
+            LookDown,
+            LookUp,
             MoveForward,
             MoveTangentially,
             OrientHorizontal,
             OrientVertical,
             SetAgentPose,
             SetSensorRotation,
+            TurnLeft,
+            TurnRight,
         )
         self._last_action_feedback = None
         last_action: Action | None = None
@@ -1518,6 +1526,22 @@ class RoboDKFanucEnvironment:
                 "SetSensorRotation; calibrate a gimbal or remove this action "
                 "from the motor policy"
             )
+
+    def actuate_look_down(self, action: LookDown) -> None:
+        rotation_degrees = float(np.clip(action.rotation_degrees, -30.0, 30.0))
+        self._relative_move(rotx(np.deg2rad(rotation_degrees)))
+
+    def actuate_look_up(self, action: LookUp) -> None:
+        rotation_degrees = float(np.clip(action.rotation_degrees, -30.0, 30.0))
+        self._relative_move(rotx(np.deg2rad(-rotation_degrees)))
+
+    def actuate_turn_left(self, action: TurnLeft) -> None:
+        rotation_degrees = float(np.clip(action.rotation_degrees, -30.0, 30.0))
+        self._relative_move(roty(np.deg2rad(-rotation_degrees)))
+
+    def actuate_turn_right(self, action: TurnRight) -> None:
+        rotation_degrees = float(np.clip(action.rotation_degrees, -30.0, 30.0))
+        self._relative_move(roty(np.deg2rad(rotation_degrees)))
 
     def reset(self) -> tuple[Observations, ProprioceptiveState]:
         self._last_action_feedback = None
